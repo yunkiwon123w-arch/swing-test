@@ -1,4 +1,3 @@
 streamlit>=1.42
-pykrx>=1.0.48
+finance-datareader>=0.9.96
 pandas>=2.2
-numpy>=1.26
