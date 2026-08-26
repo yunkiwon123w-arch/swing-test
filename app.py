@@ -5,8 +5,8 @@ import time
 from datetime import date
 from io import BytesIO
 
-st.set_page_config(page_title="단기스윙 v13 종가베팅 비교", layout="wide")
-st.title("📌 단기스윙 v13.0 · 진입방식/종가베팅 비교")
+st.set_page_config(page_title="단기스윙 v13.1 종가베팅 비교 수정판", layout="wide")
+st.title("📌 단기스윙 v13.1 · 진입방식/종가베팅 비교 수정판")
 st.caption("F1+F2 신호 고정 · 현재 돌파진입 vs 돌파일 종가베팅 vs 종가강도 확인형 종가베팅 · 승률 최우선 비교")
 
 # ============================================================
@@ -2067,11 +2067,21 @@ def v13_make_entry(d, setup, mode):
 
 
 def v13_evaluate_trade(d, setup, entry):
-    """기존 X3 청산구조는 동일하게 유지.
-    진입가만 전략별로 다르게 적용한다.
+    """
+    v13.1 수정 핵심
+    ----------------
+    1) B/C는 돌파일 '종가' 진입이므로 진입 당일 High/Low를
+       매수 이후 가격처럼 사용하지 않는다.
+    2) A는 장중 돌파가 진입이라 일봉만으로 High/Low의 선후관계를
+       알 수 없다. 따라서 진입 당일 Low로 임의 손절하지 않는다.
+       단, 진입 당일 종가가 초기손절가 이하라면 돌파 진입 후
+       종가까지 내려온 것이 확실하므로 당일 손절로 처리한다.
+    3) 정상적인 손절/트레일/MFE/MAE 평가는 다음 거래일부터 시작한다.
+    4) 최대 보유기간은 진입 후 '완전한 5거래일'로 통일한다.
     """
     entry_i = int(entry["_entry_i"])
     entry_price = float(entry["진입가"])
+    mode = str(entry["진입전략"])
 
     initial_stop = entry_price * (1 - 0.03)
 
@@ -2079,19 +2089,89 @@ def v13_evaluate_trade(d, setup, entry):
     mfe = 0.0
     mae = 0.0
 
-    last_i = min(
-        len(d) - 1,
-        entry_i + HOLDING_DAYS - 1
-    )
-
     exit_i = None
     exit_price = None
     reason = None
 
+    # --------------------------------------------------------
+    # A만: 진입 당일 '확실한' 손절 여부만 판정
+    # --------------------------------------------------------
+    if mode == "A 현재 돌파진입":
+        entry_close = float(d.iloc[entry_i]["Close"])
+
+        # 돌파가에 실제 진입했다면, 종가가 손절선 이하인 경우
+        # 진입 이후 손절선을 통과한 사실이 확실하다.
+        if entry_close <= initial_stop:
+            exit_i = entry_i
+            exit_price = initial_stop
+            reason = "손절(당일확정)"
+            mae = -3.0
+
+    # 이미 당일 확정 손절이면 즉시 반환
+    if exit_i is not None:
+        gross_ret = (exit_price / entry_price - 1) * 100
+        net_ret = gross_ret - TOTAL_COST
+
+        return {
+            "청산평가시작": "진입당일 확정손절",
+            "초기손절가": round(initial_stop),
+            "청산일": d.index[exit_i].date(),
+            "청산가": round(exit_price),
+            "청산사유": reason,
+            "손절": True,
+            "총수익률(%)": round(gross_ret, 2),
+            "거래비용(%)": round(TOTAL_COST, 2),
+            "순수익률(%)": round(net_ret, 2),
+            "MFE(%)": round(mfe, 2),
+            "MAE(%)": round(mae, 2),
+            "+3%": False,
+            "+5%": False,
+            "+7%": False,
+            "+10%": False,
+        }
+
+    # --------------------------------------------------------
+    # 모든 전략: 다음 거래일부터 정상 평가
+    # --------------------------------------------------------
+    start_i = entry_i + 1
+
+    if start_i >= len(d):
+        # 다음 거래일 데이터가 없으면 진입일 종가로 종료
+        exit_i = entry_i
+        exit_price = float(d.iloc[entry_i]["Close"])
+        reason = "데이터종료"
+
+        gross_ret = (exit_price / entry_price - 1) * 100
+        net_ret = gross_ret - TOTAL_COST
+
+        return {
+            "청산평가시작": "다음거래일",
+            "초기손절가": round(initial_stop),
+            "청산일": d.index[exit_i].date(),
+            "청산가": round(exit_price),
+            "청산사유": reason,
+            "손절": False,
+            "총수익률(%)": round(gross_ret, 2),
+            "거래비용(%)": round(TOTAL_COST, 2),
+            "순수익률(%)": round(net_ret, 2),
+            "MFE(%)": 0.0,
+            "MAE(%)": 0.0,
+            "+3%": False,
+            "+5%": False,
+            "+7%": False,
+            "+10%": False,
+        }
+
+    # 진입 후 완전한 HOLDING_DAYS 거래일을 평가
+    last_i = min(
+        len(d) - 1,
+        entry_i + HOLDING_DAYS
+    )
+
     activated = False
     highest_before_today = entry_price
 
-    for i in range(entry_i, last_i + 1):
+    for i in range(start_i, last_i + 1):
         r = d.iloc[i]
         high = float(r["High"])
         low = float(r["Low"])
@@ -2105,6 +2185,8 @@ def v13_evaluate_trade(d, setup, entry):
         high_ret = (high / entry_price - 1) * 100
         low_ret = (low / entry_price - 1) * 100
 
+        # 일봉 내 stop/high 선후관계가 불명확한 경우
+        # 기존 전략과 동일하게 stop 우선으로 보수 처리
         if low <= active_stop:
             mae = min(
                 mae,
@@ -2147,11 +2229,12 @@ def v13_evaluate_trade(d, setup, entry):
     net_ret = gross_ret - TOTAL_COST
 
     return {
+        "청산평가시작": "다음거래일",
         "초기손절가": round(initial_stop),
         "청산일": d.index[exit_i].date(),
         "청산가": round(exit_price),
         "청산사유": reason,
-        "손절": reason == "손절",
+        "손절": str(reason).startswith("손절"),
         "총수익률(%)": round(gross_ret, 2),
         "거래비용(%)": round(TOTAL_COST, 2),
         "순수익률(%)": round(net_ret, 2),
@@ -2170,7 +2253,7 @@ def v13_stats(df):
         s["손절률(%)"] = 0.0
     else:
         s["손절률(%)"] = round(
-            (df["청산사유"] == "손절").mean() * 100,
+            df["청산사유"].astype(str).str.startswith("손절").mean() * 100,
             1
         )
     return s
@@ -2256,7 +2339,7 @@ def v13_time_split(df, ratio=0.60):
 # UI
 # ============================================================
 with st.sidebar:
-    st.header("v13.0 비교 설정")
+    st.header("v13.1 비교 설정")
 
     end_date = st.date_input(
         "종료일",
@@ -2277,15 +2360,16 @@ with st.sidebar:
     )
 
     run = st.button(
-        "▶ v13 진입방식 비교",
+        "▶ v13.1 진입방식 재검증",
         type="primary",
         use_container_width=True
     )
 
 st.info(
-    "F1+F2 종목선정은 그대로 유지하고 진입 방식만 바꿉니다. "
-    "A=현재 돌파가 진입, B=돌파일 종가 진입, C=돌파일 종가 + 양봉 + 5일선 위/상승 + 종가위치 70% 이상. "
-    "청산은 모두 -3% 손절 / +2% 활성 / 2% 트레일 / 최대 5거래일 / 비용 0.40%로 동일합니다."
+    "v13.1 수정판: F1+F2 종목선정과 A/B/C 진입조건은 그대로 유지합니다. "
+    "B/C 종가진입은 진입 당일 High/Low를 절대 청산판정에 사용하지 않고 다음 거래일부터 평가합니다. "
+    "A 돌파진입도 당일 Low의 선후관계를 알 수 없으므로 사용하지 않으며, 당일 종가가 -3% 손절선 이하인 확정 손절만 반영합니다. "
+    "이후 모든 전략은 -3% 손절 / +2% 활성 / 2% 트레일 / 진입 후 5거래일 / 비용 0.40%로 동일하게 비교합니다."
 )
 
 if run:
@@ -2641,13 +2725,48 @@ if run:
             )
 
     # ========================================================
-    # ⑦ actual trades
+    # ⑦ 시계열 오류 수정 감사
     # ========================================================
-    st.subheader("⑦ 거래별 결과")
+    st.subheader("⑦ v13.1 시계열 수정 감사")
+
+    timing_audit = pd.DataFrame([
+        {
+            "전략":"A 현재 돌파진입",
+            "진입시점":"돌파일 장중 돌파가",
+            "진입당일 Low 사용":"사용 안 함",
+            "진입당일 예외":"종가가 -3% 손절선 이하일 때만 확정손절",
+            "정상 청산평가":"다음 거래일부터"
+        },
+        {
+            "전략":"B 돌파일 종가베팅",
+            "진입시점":"돌파일 종가",
+            "진입당일 Low 사용":"사용 안 함",
+            "진입당일 예외":"없음",
+            "정상 청산평가":"다음 거래일부터"
+        },
+        {
+            "전략":"C 종가강도 종가베팅",
+            "진입시점":"돌파일 종가",
+            "진입당일 Low 사용":"사용 안 함",
+            "진입당일 예외":"없음",
+            "정상 청산평가":"다음 거래일부터"
+        },
+    ])
+
+    st.dataframe(
+        timing_audit,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ========================================================
+    # ⑧ actual trades
+    # ========================================================
+    st.subheader("⑧ 거래별 결과")
 
     cols = [
         "진입전략","종목명","코드","기준봉일","눌림일","돌파일",
-        "진입일","진입가","진입설명",
+        "진입일","진입가","진입설명","청산평가시작",
         "돌파종가수익률(%)","전고점20이격(%)",
         "돌파봉종가위치(%)","진입5일선이격(%)",
         "청산일","청산가","청산사유",
@@ -2668,14 +2787,15 @@ if run:
     # ========================================================
     # Excel
     # ========================================================
-    st.subheader("⑧ 전체 v13 결과 Excel")
+    st.subheader("⑨ 전체 v13.1 결과 Excel")
 
     settings_df = pd.DataFrame([
         {"항목":"종목선정","값":"F1+F2 고정"},
         {"항목":"A","값":"눌림고가 돌파 당일 돌파가 진입"},
         {"항목":"B","값":"F1+F2 돌파일 종가 진입"},
         {"항목":"C","값":"B + 양봉 + 종가>5MA + 5MA상승 + 종가위치70%↑"},
-        {"항목":"청산","값":"-3% / +2% 활성 / 2% 트레일 / 5일 / 비용0.40%"},
+        {"항목":"청산","값":"-3% / +2% 활성 / 2% 트레일 / 진입 후 5거래일 / 비용0.40%"},
+        {"항목":"v13.1 수정","값":"B/C 진입당일 OHLC 미사용, A 당일 Low 미사용 + 종가 확정손절만 반영"},
         {"항목":"평가우선순위","값":"승률 > 표본수 > 평균수익률 > PF > 손절률"},
     ])
 
@@ -2686,20 +2806,21 @@ if run:
         "03_연도별": year_df,
         "04_C보존율": c_table,
         "05_전체거래": result,
+        "06_시계열수정감사": timing_audit,
     }
 
     if not paired.empty:
-        sheets["06_A_B직접비교"] = paired
-        sheets["07_A_B요약"] = pair_summary
+        sheets["07_A_B직접비교"] = paired
+        sheets["08_A_B요약"] = pair_summary
 
     excel_bytes = build_excel(
         sheets
     )
 
     st.download_button(
-        "📦 v13.0 종가베팅 비교 전체 Excel 다운로드",
+        "📦 v13.1 종가베팅 비교 수정판 Excel 다운로드",
         data=excel_bytes,
-        file_name="swing_v13_0_close_bet_entry_comparison.xlsx",
+        file_name="swing_v13_1_close_bet_entry_comparison_fixed.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
@@ -2711,7 +2832,7 @@ if run:
             st.write(errors)
 
 st.caption(
-    "v13.0은 진입방식 비교판입니다. "
-    "F1+F2 종목선정과 청산규칙은 동일하게 두고, 진입가/종가강도 확인만 바꿔 "
+    "v13.1은 v13.0의 일봉 시계열 오류를 수정한 재검증판입니다. "
+    "F1+F2 종목선정과 A/B/C 조건은 동일하게 두고, 진입 당일 OHLC 시계열 오류만 수정하여 "
     "승률이 실제로 개선되는지 비교합니다."
 )
