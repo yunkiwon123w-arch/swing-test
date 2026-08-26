@@ -5,9 +5,9 @@ import time
 from datetime import date
 from io import BytesIO
 
-st.set_page_config(page_title="단기스윙 v12.1 점수구간 독립검증", layout="wide")
-st.title("🧪 단기스윙 v12.1 · 점수구간 독립검증")
-st.caption("v12.0 점수모델 완전 동결 · 50/55/60/65/70점 기준을 새 미사용 KOSPI 종목군에서 비교")
+st.set_page_config(page_title="단기스윙 v13 종가베팅 비교", layout="wide")
+st.title("📌 단기스윙 v13.0 · 진입방식/종가베팅 비교")
+st.caption("F1+F2 신호 고정 · 현재 돌파진입 vs 돌파일 종가베팅 vs 종가강도 확인형 종가베팅 · 승률 최우선 비교")
 
 # ============================================================
 # 완전 동결된 전략값
@@ -1996,48 +1996,302 @@ def threshold_yearly(df):
 
     return pd.DataFrame(rows)
 
+
+# ============================================================
+# v13 entry-style comparison
+# ============================================================
+V13_ENTRY_MODES = [
+    "A 현재 돌파진입",
+    "B 돌파일 종가베팅",
+    "C 종가강도 종가베팅",
+]
+
+def v13_make_entry(d, setup, mode):
+    breakout_i = int(setup["_breakout_i"])
+    br = d.iloc[breakout_i]
+    level = float(setup["눌림고가"])
+
+    if mode == "A 현재 돌파진입":
+        return {
+            "진입전략": mode,
+            "진입일": d.index[breakout_i].date(),
+            "진입가": level,
+            "_entry_i": breakout_i,
+            "진입설명": "눌림고가 돌파 당일 돌파가 진입",
+        }
+
+    if mode == "B 돌파일 종가베팅":
+        return {
+            "진입전략": mode,
+            "진입일": d.index[breakout_i].date(),
+            "진입가": float(br["Close"]),
+            "_entry_i": breakout_i,
+            "진입설명": "F1+F2 충족 돌파일 종가 진입",
+        }
+
+    if mode == "C 종가강도 종가베팅":
+        # 공개된 '강한 종목의 종가베팅' 구조를 정량화한 비교용 가설.
+        # 1) 양봉
+        # 2) 종가 > 5일선
+        # 3) 5일선 상승
+        # 4) 종가가 당일 Range 상단 70% 이상
+        prev_ma5 = d["MA5"].iloc[breakout_i - 1] if breakout_i > 0 else None
+        rng = float(br["High"]) - float(br["Low"])
+
+        bullish = float(br["Close"]) > float(br["Open"])
+        above_ma5 = pd.notna(br["MA5"]) and float(br["Close"]) > float(br["MA5"])
+        rising_ma5 = (
+            pd.notna(br["MA5"])
+            and pd.notna(prev_ma5)
+            and float(br["MA5"]) > float(prev_ma5)
+        )
+        close_pos = (
+            (float(br["Close"]) - float(br["Low"])) / rng * 100.0
+            if rng > 0 else 0.0
+        )
+        strong_close = close_pos >= 70.0
+
+        if not (bullish and above_ma5 and rising_ma5 and strong_close):
+            return None
+
+        return {
+            "진입전략": mode,
+            "진입일": d.index[breakout_i].date(),
+            "진입가": float(br["Close"]),
+            "_entry_i": breakout_i,
+            "진입설명": "돌파일 종가 + 양봉 + 5일선 위/상승 + 종가위치70%↑",
+            "종가위치(%)": round(close_pos, 2),
+        }
+
+    return None
+
+
+def v13_evaluate_trade(d, setup, entry):
+    """기존 X3 청산구조는 동일하게 유지.
+    진입가만 전략별로 다르게 적용한다.
+    """
+    entry_i = int(entry["_entry_i"])
+    entry_price = float(entry["진입가"])
+
+    initial_stop = entry_price * (1 - 0.03)
+
+    hit = {t: False for t in TARGETS}
+    mfe = 0.0
+    mae = 0.0
+
+    last_i = min(
+        len(d) - 1,
+        entry_i + HOLDING_DAYS - 1
+    )
+
+    exit_i = None
+    exit_price = None
+    reason = None
+
+    activated = False
+    highest_before_today = entry_price
+
+    for i in range(entry_i, last_i + 1):
+        r = d.iloc[i]
+        high = float(r["High"])
+        low = float(r["Low"])
+
+        if activated:
+            trailing = highest_before_today * (1 - 0.02)
+            active_stop = max(entry_price, trailing)
+        else:
+            active_stop = initial_stop
+
+        high_ret = (high / entry_price - 1) * 100
+        low_ret = (low / entry_price - 1) * 100
+
+        if low <= active_stop:
+            mae = min(
+                mae,
+                (active_stop / entry_price - 1) * 100
+            )
+
+            if high < entry_price * 1.02:
+                mfe = max(mfe, max(0.0, high_ret))
+
+            exit_i = i
+            exit_price = active_stop
+            reason = (
+                "본전/트레일"
+                if activated and active_stop >= entry_price
+                else "손절"
+            )
+            break
+
+        mfe = max(mfe, high_ret)
+        mae = min(mae, low_ret)
+
+        for t in TARGETS:
+            if high >= entry_price * (1 + t / 100):
+                hit[t] = True
+
+        if high >= entry_price * 1.02:
+            activated = True
+
+        highest_before_today = max(
+            highest_before_today,
+            high
+        )
+
+    if exit_i is None:
+        exit_i = last_i
+        exit_price = float(d.iloc[last_i]["Close"])
+        reason = "기간종료"
+
+    gross_ret = (exit_price / entry_price - 1) * 100
+    net_ret = gross_ret - TOTAL_COST
+
+    return {
+        "초기손절가": round(initial_stop),
+        "청산일": d.index[exit_i].date(),
+        "청산가": round(exit_price),
+        "청산사유": reason,
+        "손절": reason == "손절",
+        "총수익률(%)": round(gross_ret, 2),
+        "거래비용(%)": round(TOTAL_COST, 2),
+        "순수익률(%)": round(net_ret, 2),
+        "MFE(%)": round(mfe, 2),
+        "MAE(%)": round(mae, 2),
+        "+3%": hit[3.0],
+        "+5%": hit[5.0],
+        "+7%": hit[7.0],
+        "+10%": hit[10.0],
+    }
+
+
+def v13_stats(df):
+    s = performance_stats(df)
+    if df.empty:
+        s["손절률(%)"] = 0.0
+    else:
+        s["손절률(%)"] = round(
+            (df["청산사유"] == "손절").mean() * 100,
+            1
+        )
+    return s
+
+
+def v13_rank_table(result):
+    rows = []
+    for mode in V13_ENTRY_MODES:
+        q = result[result["진입전략"] == mode].copy()
+        s = v13_stats(q)
+        rows.append({
+            "진입전략": mode,
+            **s
+        })
+
+    out = pd.DataFrame(rows)
+
+    # 승률 > 표본수 > 평균수익률 > PF > 낮은 손절률
+    out = out.sort_values(
+        [
+            "승률(%)",
+            "신호",
+            "평균수익률(%)",
+            "ProfitFactor",
+            "손절률(%)"
+        ],
+        ascending=[
+            False,
+            False,
+            False,
+            False,
+            True
+        ]
+    ).reset_index(drop=True)
+
+    out.insert(0, "순위", range(1, len(out)+1))
+    return out
+
+
+def v13_yearly(df):
+    q = df.copy()
+    q["연도"] = pd.to_datetime(q["진입일"]).dt.year
+
+    rows = []
+
+    for (mode, y), g in q.groupby(["진입전략","연도"]):
+        rows.append({
+            "진입전략": mode,
+            "연도": int(y),
+            **v13_stats(g)
+        })
+
+    return pd.DataFrame(rows)
+
+
+def v13_time_split(df, ratio=0.60):
+    rows = []
+
+    # 각 전략을 자신의 신호 시간순으로 60/40
+    for mode in V13_ENTRY_MODES:
+        q = df[df["진입전략"] == mode].copy()
+        train, test, split_date = fixed_time_split(q, ratio)
+
+        if not train.empty:
+            rows.append({
+                "진입전략": mode,
+                "구간": "앞60%",
+                "시작일": None,
+                **v13_stats(train)
+            })
+
+        if not test.empty:
+            rows.append({
+                "진입전략": mode,
+                "구간": "뒤40%",
+                "시작일": split_date,
+                **v13_stats(test)
+            })
+
+    return pd.DataFrame(rows)
+
 # ============================================================
 # UI
 # ============================================================
 with st.sidebar:
-    st.header("v12.1 독립검증 설정")
+    st.header("v13.0 비교 설정")
 
     end_date = st.date_input(
         "종료일",
-        date(2026,7,31),
-        disabled=True
+        date(2026,7,31)
     )
 
-    years = st.number_input(
-        "검증 기간(년)",
-        min_value=5,
-        max_value=5,
-        value=5,
-        disabled=True
+    years = st.selectbox(
+        "검증 기간",
+        [3,4,5],
+        index=2,
+        format_func=lambda x:f"{x}년"
     )
 
     universe_n = st.selectbox(
-        "새 미사용 KOSPI 종목 수",
-        [50, 75, 100, 150],
-        index=2
+        "KOSPI 검증 종목 수",
+        [300,500,700],
+        index=1
     )
 
     run = st.button(
-        "▶ v12.1 점수구간 독립검증",
+        "▶ v13 진입방식 비교",
         type="primary",
         use_container_width=True
     )
 
 st.info(
-    "v12.1에서는 점수모델을 다시 학습하지 않습니다. "
-    "v12.0에서 확정된 8개 변수, 방향, 가중치, 개발 IS 기준분포까지 코드에 고정했습니다. "
-    "앞서 사용한 KOSPI 900종목을 제외한 이후 미사용 종목에서 50/55/60/65/70점 기준을 그대로 비교합니다."
+    "F1+F2 종목선정은 그대로 유지하고 진입 방식만 바꿉니다. "
+    "A=현재 돌파가 진입, B=돌파일 종가 진입, C=돌파일 종가 + 양봉 + 5일선 위/상승 + 종가위치 70% 이상. "
+    "청산은 모두 -3% 손절 / +2% 활성 / 2% 트레일 / 최대 5거래일 / 비용 0.40%로 동일합니다."
 )
 
 if run:
     end_ts = pd.Timestamp(end_date)
     cut = end_ts - pd.DateOffset(years=int(years))
-    start_ts = cut - pd.Timedelta(days=180)
+    start_ts = cut - pd.Timedelta(days=120)
     fetch_end = end_ts + pd.Timedelta(days=45)
 
     try:
@@ -2047,56 +2301,30 @@ if run:
         st.exception(e)
         st.stop()
 
-    universe, overlap, total_kospi = v121_independent_universe(
-        listing,
-        int(universe_n)
+    # KOSPI 내 넓은 표본. v13은 진입방식 비교가 목적이라
+    # 세 전략이 동일한 F1+F2 신호를 공유한다.
+    universe = (
+        listing[listing["Market"] == "KOSPI"]
+        .sort_values("Code")
+        .head(int(universe_n))
+        .copy()
+        .reset_index(drop=True)
     )
-
-    if overlap:
-        st.error(
-            f"독립표본 오류: 기존 사용군과 {len(overlap)}종목 중복"
-        )
-        st.stop()
-
-    if universe.empty:
-        st.error(
-            f"KOSPI 전체 {total_kospi}종목 중 앞 {V121_PRIOR_USED_N}종목을 제외하면 "
-            "검증 가능한 미사용 종목이 없습니다."
-        )
-        st.stop()
-
-    st.write(
-        f"**실제 새 독립표본:** {len(universe)}종목 "
-        f"(KOSPI 전체 {total_kospi}종목 중 앞 {V121_PRIOR_USED_N}개 제외)"
-    )
-
-    try:
-        ks11 = load_benchmark(
-            "KS11",
-            (start_ts-pd.Timedelta(days=220)).strftime("%Y-%m-%d"),
-            fetch_end.strftime("%Y-%m-%d")
-        )
-    except Exception as e:
-        st.error(f"KOSPI 지수 조회 실패: {type(e).__name__}")
-        st.stop()
-
-    if ks11 is None or ks11.empty:
-        st.error("KOSPI 지수 데이터가 없습니다.")
-        st.stop()
 
     progress = st.progress(0)
     status = st.empty()
+
     setups = []
     data_map = {}
     errors = []
     total = len(universe)
 
-    for pos, (_, r) in enumerate(universe.iterrows(), 1):
+    for pos, (_, r) in enumerate(universe.iterrows(),1):
         code0 = str(r["Code"]).zfill(6)
         name = r["Name"]
 
         status.info(
-            f"1/2 새 독립군 데이터/신호 {pos}/{total} · {name}"
+            f"1/2 데이터/신호 {pos}/{total} · {name}"
         )
 
         try:
@@ -2106,7 +2334,7 @@ if run:
                 fetch_end.strftime("%Y-%m-%d")
             )
 
-            if d is None or d.empty or len(d) < 140:
+            if d is None or d.empty or len(d) < 100:
                 continue
 
             found, prepared = find_setups(
@@ -2133,10 +2361,12 @@ if run:
 
     if not setups:
         progress.empty()
-        status.warning("새 독립군에서 setup이 없습니다.")
+        status.warning("setup이 없습니다.")
         st.stop()
 
-    setup_df = dedup_setups(pd.DataFrame(setups))
+    setup_df = dedup_setups(
+        pd.DataFrame(setups)
+    )
 
     selected = setup_df[
         setup_df.apply(
@@ -2147,286 +2377,290 @@ if run:
 
     rows = []
 
-    for idx, (_, setup) in enumerate(selected.iterrows(), 1):
+    combo_total = len(selected) * len(V13_ENTRY_MODES)
+    done = 0
+
+    for _, setup in selected.iterrows():
         code0 = str(setup["코드"]).zfill(6)
         d = data_map.get(code0)
 
         if d is None:
             continue
 
-        entry = make_entry(d, setup)
-        ev = evaluate_trade(d, setup, entry)
-
-        row = setup.drop(
-            labels=["_b","_pull_i","_breakout_i"],
-            errors="ignore"
-        ).to_dict()
-
-        row.update({
-            k:v for k,v in entry.items()
-            if not k.startswith("_")
-        })
-
-        row.update(ev)
-        row.update(setup_features(d, setup))
-        rows.append(row)
-
-        if len(selected):
-            progress.progress(
-                0.5 + idx/(len(selected)*2)
+        for mode in V13_ENTRY_MODES:
+            entry = v13_make_entry(
+                d,
+                setup,
+                mode
             )
+
+            if entry is None:
+                done += 1
+                continue
+
+            ev = v13_evaluate_trade(
+                d,
+                setup,
+                entry
+            )
+
+            row = setup.drop(
+                labels=[
+                    "_b",
+                    "_pull_i",
+                    "_breakout_i"
+                ],
+                errors="ignore"
+            ).to_dict()
+
+            row.update({
+                k:v for k,v in entry.items()
+                if not k.startswith("_")
+            })
+
+            row.update(ev)
+            row.update(setup_features(d, setup))
+            rows.append(row)
+
+            done += 1
+
+            if combo_total:
+                progress.progress(
+                    0.5 + min(done/combo_total,1.0)*0.5
+                )
 
     progress.empty()
 
-    trades = pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
 
-    if trades.empty:
-        status.warning("새 독립군에서 F1+F2 거래가 없습니다.")
+    if result.empty:
+        status.warning("실제 거래가 생성되지 않았습니다.")
         st.stop()
 
-    trades = attach_kospi_market_features(
-        trades,
-        ks11
-    )
-
-    model = v121_frozen_model()
-    scored = apply_score_model(
-        trades,
-        model
-    )
-
     status.success(
-        f"완료 · 새 미사용 KOSPI {len(universe)}종목 · "
-        f"F1+F2 거래 {len(scored)}건"
+        f"완료 · KOSPI {len(universe)}종목 · "
+        f"F1+F2 setup {len(selected)}건 · "
+        f"진입전략 거래 {len(result)}건"
     )
 
     # ========================================================
-    # ① Frozen model audit
+    # ① headline
     # ========================================================
-    st.subheader("① v12.0 점수모델 동결 확인")
+    st.subheader("① 진입방식 전체 비교")
 
-    model_rows = []
-    for f, meta in V121_FROZEN_REFS.items():
-        model_rows.append({
-            "변수":f,
-            "가중치":meta["weight"],
-            "방향":"높을수록 유리" if meta["direction"] > 0 else "낮을수록 유리",
-            "고정기준값수":len(meta["values"]),
-        })
-
-    model_audit = pd.DataFrame(model_rows)
+    rank_df = v13_rank_table(result)
 
     st.dataframe(
-        model_audit,
+        rank_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    top = rank_df.iloc[0]
+
+    st.success(
+        f'현재 승률 1위: **{top["진입전략"]}** · '
+        f'승률 {top["승률(%)"]:.1f}% · '
+        f'{int(top["신호"])}건 · '
+        f'평균 {top["평균수익률(%)"]:.2f}% · '
+        f'PF {("-" if pd.isna(top["ProfitFactor"]) else f"{top["ProfitFactor"]:.2f}")} · '
+        f'손절률 {top["손절률(%)"]:.1f}%'
+    )
+
+    # ========================================================
+    # ② paired signals A vs B
+    # ========================================================
+    st.subheader("② 같은 F1+F2 신호에서 A vs B 직접 비교")
+
+    a = result[result["진입전략"]=="A 현재 돌파진입"][
+        ["코드","돌파일","순수익률(%)"]
+    ].rename(columns={"순수익률(%)":"A수익률"})
+
+    b = result[result["진입전략"]=="B 돌파일 종가베팅"][
+        ["코드","돌파일","순수익률(%)"]
+    ].rename(columns={"순수익률(%)":"B수익률"})
+
+    paired = a.merge(
+        b,
+        on=["코드","돌파일"],
+        how="inner"
+    )
+
+    if not paired.empty:
+        paired["A승리"] = paired["A수익률"] > 0
+        paired["B승리"] = paired["B수익률"] > 0
+        paired["B-A수익률차"] = paired["B수익률"] - paired["A수익률"]
+
+        pair_summary = pd.DataFrame([
+            {
+                "항목":"A만 승리",
+                "건수":int(((paired["A승리"]) & (~paired["B승리"])).sum())
+            },
+            {
+                "항목":"B만 승리",
+                "건수":int(((~paired["A승리"]) & (paired["B승리"])).sum())
+            },
+            {
+                "항목":"둘 다 승리",
+                "건수":int(((paired["A승리"]) & (paired["B승리"])).sum())
+            },
+            {
+                "항목":"둘 다 손실",
+                "건수":int(((~paired["A승리"]) & (~paired["B승리"])).sum())
+            },
+            {
+                "항목":"B 평균 개선폭(%)",
+                "건수":round(paired["B-A수익률차"].mean(),2)
+            },
+        ])
+
+        st.dataframe(
+            pair_summary,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    # ========================================================
+    # ③ time robustness
+    # ========================================================
+    st.subheader("③ 전략별 시간순 60/40")
+
+    time_df = v13_time_split(
+        result,
+        0.60
+    )
+
+    st.dataframe(
+        time_df,
         use_container_width=True,
         hide_index=True
     )
 
     # ========================================================
-    # ② Thresholds
+    # ④ yearly
     # ========================================================
-    st.subheader("② 새 독립표본 · 점수 기준 비교")
+    st.subheader("④ 연도별 비교")
 
-    threshold_df = threshold_comparison_with_ci(
-        scored
+    year_df = v13_yearly(
+        result
     )
 
     st.dataframe(
-        threshold_df,
+        year_df,
         use_container_width=True,
         hide_index=True
     )
 
     # ========================================================
-    # ③ 50 below/above
+    # ⑤ C filter survival
     # ========================================================
-    st.subheader("③ 50점 미만 vs 50점 이상")
+    st.subheader("⑤ 종가강도형(C) 신호 보존율")
 
-    binary_df = low_vs_high_score(
-        scored,
-        50
+    a_n = len(
+        result[result["진입전략"]=="A 현재 돌파진입"]
+    )
+    c_n = len(
+        result[result["진입전략"]=="C 종가강도 종가베팅"]
     )
 
-    st.dataframe(
-        binary_df,
-        use_container_width=True,
-        hide_index=True
+    preservation = (
+        c_n / a_n * 100
+        if a_n else 0
     )
 
-    # ========================================================
-    # ④ bands
-    # ========================================================
-    st.subheader("④ 점수구간별 성과")
-
-    band_df = score_band_table(
-        scored
-    )
-
-    st.dataframe(
-        band_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # ⑤ interpretation
-    # ========================================================
-    st.subheader("⑤ 승률 우선 판정")
-
-    rows = []
-    for th in V121_THRESHOLDS:
-        q = scored[
-            pd.to_numeric(
-                scored["승리점수"],
-                errors="coerce"
-            ) >= th
+    c_stats = v13_stats(
+        result[
+            result["진입전략"]=="C 종가강도 종가베팅"
         ].copy()
-
-        if q.empty:
-            continue
-
-        s = performance_stats(q)
-
-        rows.append({
-            "기준":th,
-            "신호":s["신호"],
-            "승률(%)":s["승률(%)"],
-            "평균수익률(%)":s["평균수익률(%)"],
-            "PF":s["ProfitFactor"],
-            "MDD(%)":s["MDD(%)"],
-            "승률60이상":s["승률(%)"] >= 60,
-            "평균5이상":s["평균수익률(%)"] >= 5,
-            "PF3이상":(
-                s["ProfitFactor"] is not None
-                and s["ProfitFactor"] >= 3
-            ),
-        })
-
-    decision_df = pd.DataFrame(rows)
-
-    st.dataframe(
-        decision_df,
-        use_container_width=True,
-        hide_index=True
     )
 
-    # Do not auto-pick a new threshold from this final sample.
-    qualifying = decision_df[
-        (decision_df["신호"] >= 15)
-        & decision_df["승률60이상"]
-        & decision_df["평균5이상"]
-        & decision_df["PF3이상"]
-    ].copy()
-
-    if len(qualifying) >= 2:
-        st.success(
-            "점수모델 재현 신호 있음: 여러 인접 점수기준에서 동시에 "
-            "승률≥60% / 평균≥5% / PF≥3이 유지됩니다. "
-            "특정 한 컷만 우연히 좋은 형태보다 강한 결과입니다."
-        )
-    elif len(qualifying) == 1:
-        st.warning(
-            "한 개 점수기준만 목표를 통과했습니다. "
-            "특정 컷 과적합 가능성을 배제하기 어렵습니다."
-        )
-    else:
-        st.warning(
-            "새 독립표본에서 승률/수익률 동시 목표가 재현되지 않았습니다. "
-            "이 결과를 보고 점수 가중치나 컷을 다시 조정하지 않습니다."
-        )
-
-    # ========================================================
-    # ⑥ yearly
-    # ========================================================
-    st.subheader("⑥ 점수기준 × 연도")
-
-    yearly_df = threshold_yearly(
-        scored
-    )
-
-    st.dataframe(
-        yearly_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # ⑦ outlier
-    # ========================================================
-    st.subheader("⑦ 50점 이상 아웃라이어 스트레스")
-
-    high50 = scored[
-        pd.to_numeric(
-            scored["승리점수"],
-            errors="coerce"
-        ) >= 50
-    ].copy()
-
-    stress_df = stress_outliers(
-        high50
-    )
-
-    st.dataframe(
-        stress_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # ⑧ actual trades
-    # ========================================================
-    st.subheader("⑧ 새 독립군 전체 거래")
-
-    cols = [
-        "종목명","코드","진입일","승리점수",
-        "돌파갭(%)","전고점20이격(%)","눌림깊이(%)",
-        "지수60일수익률(%)","돌파종가수익률(%)",
-        "전고점60이격(%)","돌파거래대금(억)",
-        "MA60_10일기울기(%)",
-        "순수익률(%)","MFE(%)","MAE(%)","청산사유"
-    ]
-
-    st.dataframe(
-        scored[
-            [c for c in cols if c in scored.columns]
-        ].sort_values(
-            ["승리점수","진입일"],
-            ascending=[False,False]
-        ),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # ⑨ independence
-    # ========================================================
-    st.subheader("⑨ 독립표본 감사")
-
-    audit_df = pd.DataFrame([
+    c_table = pd.DataFrame([
         {
-            "항목":"v12.0 이전 사용범위",
-            "종목수":750,
-            "설명":"v11.6까지"
-        },
-        {
-            "항목":"v12.0 최종 검증군",
-            "종목수":150,
-            "설명":"750 이후 150개"
-        },
-        {
-            "항목":"v12.1 새 독립군",
-            "종목수":len(universe),
-            "설명":"앞 900개 모두 제외 후 이후 종목"
-        },
-        {
-            "항목":"중복",
-            "종목수":len(overlap),
-            "설명":"반드시 0"
-        },
+            "기준F1+F2 신호":a_n,
+            "C 진입신호":c_n,
+            "신호보존율(%)":round(preservation,1),
+            "C 승률(%)":c_stats["승률(%)"],
+            "C 평균수익률(%)":c_stats["평균수익률(%)"],
+            "C PF":c_stats["ProfitFactor"],
+            "C 손절률(%)":c_stats["손절률(%)"],
+        }
     ])
 
     st.dataframe(
-        audit_df,
+        c_table,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ========================================================
+    # ⑥ decision
+    # ========================================================
+    st.subheader("⑥ 승률 우선 판정")
+
+    eligible = rank_df[
+        (rank_df["신호"] >= 30)
+        & (rank_df["평균수익률(%)"] > 0)
+        & (rank_df["ProfitFactor"].fillna(0) >= 1.5)
+    ].copy()
+
+    if eligible.empty:
+        st.warning(
+            "충분한 표본과 수익성을 동시에 만족하는 진입방식이 없습니다."
+        )
+    else:
+        best = eligible.sort_values(
+            [
+                "승률(%)",
+                "신호",
+                "평균수익률(%)",
+                "ProfitFactor",
+                "손절률(%)"
+            ],
+            ascending=[
+                False,
+                False,
+                False,
+                False,
+                True
+            ]
+        ).iloc[0]
+
+        st.write(
+            f'**현재 우선 후보:** {best["진입전략"]}'
+        )
+
+        if best["승률(%)"] >= 60:
+            st.success(
+                f'승률 {best["승률(%)"]:.1f}%로 60% 목표를 통과하면서 '
+                f'평균수익률 {best["평균수익률(%)"]:.2f}%를 유지했습니다.'
+            )
+        else:
+            st.warning(
+                f'최고 승률이 {best["승률(%)"]:.1f}%로 60%에 미달합니다. '
+                "종가베팅이 자동으로 승률을 높인다고 결론내리면 안 됩니다."
+            )
+
+    # ========================================================
+    # ⑦ actual trades
+    # ========================================================
+    st.subheader("⑦ 거래별 결과")
+
+    cols = [
+        "진입전략","종목명","코드","기준봉일","눌림일","돌파일",
+        "진입일","진입가","진입설명",
+        "돌파종가수익률(%)","전고점20이격(%)",
+        "돌파봉종가위치(%)","진입5일선이격(%)",
+        "청산일","청산가","청산사유",
+        "순수익률(%)","MFE(%)","MAE(%)"
+    ]
+
+    st.dataframe(
+        result[
+            [c for c in cols if c in result.columns]
+        ].sort_values(
+            ["진입일","종목명","진입전략"],
+            ascending=[False,True,True]
+        ),
         use_container_width=True,
         hide_index=True
     )
@@ -2434,34 +2668,38 @@ if run:
     # ========================================================
     # Excel
     # ========================================================
-    st.subheader("⑩ 전체 v12.1 결과 Excel")
+    st.subheader("⑧ 전체 v13 결과 Excel")
 
     settings_df = pd.DataFrame([
-        {"항목":"점수모델","값":"v12.0 완전 동결"},
-        {"항목":"변수수","값":8},
-        {"항목":"비교점수","값":"50/55/60/65/70"},
-        {"항목":"중요원칙","값":"v12.1 새 표본 결과로 모델/가중치/컷 재학습 금지"},
-        {"항목":"독립범위","값":"KOSPI 앞 900종목 제외"},
+        {"항목":"종목선정","값":"F1+F2 고정"},
+        {"항목":"A","값":"눌림고가 돌파 당일 돌파가 진입"},
+        {"항목":"B","값":"F1+F2 돌파일 종가 진입"},
+        {"항목":"C","값":"B + 양봉 + 종가>5MA + 5MA상승 + 종가위치70%↑"},
+        {"항목":"청산","값":"-3% / +2% 활성 / 2% 트레일 / 5일 / 비용0.40%"},
+        {"항목":"평가우선순위","값":"승률 > 표본수 > 평균수익률 > PF > 손절률"},
     ])
 
-    excel_bytes = build_excel({
-        "00_설정":settings_df,
-        "01_모델감사":model_audit,
-        "02_점수기준비교":threshold_df,
-        "03_50점상하":binary_df,
-        "04_점수구간":band_df,
-        "05_판정표":decision_df,
-        "06_연도별":yearly_df,
-        "07_50점이상아웃라이어":stress_df,
-        "08_전체거래":scored,
-        "09_독립종목":universe,
-        "10_표본감사":audit_df,
-    })
+    sheets = {
+        "00_설정": settings_df,
+        "01_전체비교": rank_df,
+        "02_시간60_40": time_df,
+        "03_연도별": year_df,
+        "04_C보존율": c_table,
+        "05_전체거래": result,
+    }
+
+    if not paired.empty:
+        sheets["06_A_B직접비교"] = paired
+        sheets["07_A_B요약"] = pair_summary
+
+    excel_bytes = build_excel(
+        sheets
+    )
 
     st.download_button(
-        "📦 v12.1 전체 점수구간 독립검증 Excel 다운로드",
+        "📦 v13.0 종가베팅 비교 전체 Excel 다운로드",
         data=excel_bytes,
-        file_name="swing_v12_1_score_threshold_independent_validation.xlsx",
+        file_name="swing_v13_0_close_bet_entry_comparison.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
@@ -2473,7 +2711,7 @@ if run:
             st.write(errors)
 
 st.caption(
-    "v12.1은 v12.0 점수모델의 재현성 검증판입니다. "
-    "8개 변수, 방향, 가중치, 개발 IS 기준분포를 모두 고정했고, "
-    "새 독립표본에서는 점수 기준의 성과만 비교합니다."
+    "v13.0은 진입방식 비교판입니다. "
+    "F1+F2 종목선정과 청산규칙은 동일하게 두고, 진입가/종가강도 확인만 바꿔 "
+    "승률이 실제로 개선되는지 비교합니다."
 )
