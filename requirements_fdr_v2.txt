@@ -1,0 +1,3 @@
+streamlit>=1.42
+finance-datareader>=0.9.96
+pandas>=2.2
