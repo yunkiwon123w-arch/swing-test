@@ -4,9 +4,9 @@ import FinanceDataReader as fdr
 import time
 from datetime import date
 
-st.set_page_config(page_title="단기스윙 백테스트 v10.2", layout="wide")
+st.set_page_config(page_title="단기스윙 백테스트 v10.3", layout="wide")
 st.title("🧪 단기스윙 v10 · E1+X3 엣지 검증")
-st.caption("v10.1 1위 전략 고정 · 실전비용 · 최대낙폭(MDD) · 연속손실 · 시간순 OOS/WFA 검증")
+st.caption("전략/청산 고정 · 대박/수익/손절 거래의 진입 당시 특성을 비교해 유효 필터 후보 탐색")
 
 TARGETS = [3.0, 5.0, 7.0, 10.0]
 
@@ -38,8 +38,12 @@ def add_indicators(d):
     x["거래대금"] = x["Close"] * x["Volume"]
     x["MA5"] = x["Close"].rolling(5).mean()
     x["MA20"] = x["Close"].rolling(20).mean()
+    x["MA60"] = x["Close"].rolling(60).mean()
     x["AVG_VOL20"] = x["Volume"].shift(1).rolling(20).mean()
     x["등락률"] = x["Close"].pct_change() * 100
+    x["MA20기울기5일(%)"] = (x["MA20"] / x["MA20"].shift(5) - 1) * 100
+    x["전고점20"] = x["High"].shift(1).rolling(20).max()
+    x["전고점60"] = x["High"].shift(1).rolling(60).max()
     return x
 
 def base_ok(d, b, p):
@@ -400,6 +404,109 @@ def equity_curve_table(df, ret_col="순수익률(%)"):
     q["Drawdown(%)"] = (q["자산배수"] / q["고점자산배수"] - 1.0) * 100.0
     return q
 
+def entry_features(d, setup, entry):
+    """진입 직전/당일에 알 수 있었던 정보만 추출한다."""
+    entry_date = pd.Timestamp(entry["진입일"])
+    matches = d.index[d.index.normalize() == entry_date.normalize()]
+    if not len(matches):
+        return {}
+    entry_i = d.index.get_loc(matches[0])
+
+    br_date = pd.Timestamp(setup["돌파일"])
+    br_matches = d.index[d.index.normalize() == br_date.normalize()]
+    if not len(br_matches):
+        return {}
+    breakout_i = d.index.get_loc(br_matches[0])
+
+    e = d.iloc[entry_i]
+    br = d.iloc[breakout_i]
+
+    def safe_pct(a, b):
+        if pd.isna(a) or pd.isna(b) or float(b) == 0:
+            return float("nan")
+        return (float(a) / float(b) - 1) * 100.0
+
+    br_high = float(br["High"])
+    br_low = float(br["Low"])
+    br_range = max(br_high - br_low, 1.0)
+
+    return {
+        "진입거래대금(억)": round(float(e["거래대금"]) / 1e8, 2) if pd.notna(e["거래대금"]) else None,
+        "진입거래량배수20": round(float(e["Volume"] / e["AVG_VOL20"]), 2) if pd.notna(e["AVG_VOL20"]) and e["AVG_VOL20"] != 0 else None,
+        "진입5일선이격(%)": round(safe_pct(e["Close"], e["MA5"]), 2),
+        "진입20일선이격(%)": round(safe_pct(e["Close"], e["MA20"]), 2),
+        "진입60일선이격(%)": round(safe_pct(e["Close"], e["MA60"]), 2),
+        "20일선5일기울기(%)": round(float(e["MA20기울기5일(%)"]), 2) if pd.notna(e["MA20기울기5일(%)"]) else None,
+        "전고점20이격(%)": round(safe_pct(e["Close"], e["전고점20"]), 2),
+        "전고점60이격(%)": round(safe_pct(e["Close"], e["전고점60"]), 2),
+        "돌파봉등락률(%)": round(float(br["등락률"]), 2) if pd.notna(br["등락률"]) else None,
+        "돌파봉종가위치(%)": round((float(br["Close"]) - br_low) / br_range * 100.0, 2),
+        "돌파봉거래대금(억)": round(float(br["거래대금"]) / 1e8, 2) if pd.notna(br["거래대금"]) else None,
+        "돌파봉거래량배수20": round(float(br["Volume"] / br["AVG_VOL20"]), 2) if pd.notna(br["AVG_VOL20"]) and br["AVG_VOL20"] != 0 else None,
+        "돌파거래량vs눌림(배)": setup.get("돌파거래량vs눌림(배)"),
+        "돌파종가수익률(%)": setup.get("돌파종가수익률(%)"),
+        "기준봉상승률(%)": setup.get("기준봉상승률(%)"),
+        "기준봉거래량배수": setup.get("기준봉거래량배수"),
+        "기준봉거래대금(억)": setup.get("거래대금(억)"),
+        "눌림깊이(%)": setup.get("눌림깊이(%)"),
+    }
+
+def classify_trade(ret):
+    if ret >= 10:
+        return "대박(+10%↑)"
+    if ret > 0:
+        return "수익(0~10%)"
+    return "손절/손실"
+
+def standardized_group_compare(df, features):
+    rows = []
+    groups = ["대박(+10%↑)", "수익(0~10%)", "손절/손실"]
+    for f in features:
+        vals = {}
+        for g in groups:
+            q = df.loc[df["결과군"] == g, f].dropna()
+            vals[g] = {"mean": q.mean() if len(q) else float("nan"), "median": q.median() if len(q) else float("nan"), "n": len(q)}
+        all_std = df[f].std()
+        jm = vals["대박(+10%↑)"]["mean"]
+        lm = vals["손절/손실"]["mean"]
+        effect = ((jm-lm)/all_std if pd.notna(jm) and pd.notna(lm) and pd.notna(all_std) and all_std != 0 else float("nan"))
+        rows.append({
+            "변수": f,
+            "대박평균": None if pd.isna(vals["대박(+10%↑)"]["mean"]) else round(vals["대박(+10%↑)"]["mean"],2),
+            "대박중앙": None if pd.isna(vals["대박(+10%↑)"]["median"]) else round(vals["대박(+10%↑)"]["median"],2),
+            "수익평균": None if pd.isna(vals["수익(0~10%)"]["mean"]) else round(vals["수익(0~10%)"]["mean"],2),
+            "수익중앙": None if pd.isna(vals["수익(0~10%)"]["median"]) else round(vals["수익(0~10%)"]["median"],2),
+            "손실평균": None if pd.isna(vals["손절/손실"]["mean"]) else round(vals["손절/손실"]["mean"],2),
+            "손실중앙": None if pd.isna(vals["손절/손실"]["median"]) else round(vals["손절/손실"]["median"],2),
+            "대박-손실 표준화차이": None if pd.isna(effect) else round(effect,2),
+            "대박N": vals["대박(+10%↑)"]["n"], "수익N": vals["수익(0~10%)"]["n"], "손실N": vals["손절/손실"]["n"],
+        })
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["_abs"] = out["대박-손실 표준화차이"].abs()
+        out = out.sort_values("_abs", ascending=False).drop(columns="_abs")
+    return out
+
+def quartile_feature_performance(df, feature):
+    q = df[[feature, "순수익률(%)"]].dropna().copy()
+    if q.empty:
+        return pd.DataFrame()
+    try:
+        q["구간"] = pd.qcut(q[feature], 4, duplicates="drop")
+    except Exception:
+        q["구간"] = pd.cut(q[feature], 4, duplicates="drop")
+    g = q.groupby("구간", observed=True).agg(
+        신호=(feature, "size"),
+        변수평균=(feature, "mean"),
+        평균수익률=("순수익률(%)", "mean"),
+        승률=("순수익률(%)", lambda s: (s > 0).mean()*100),
+        대박률=("순수익률(%)", lambda s: (s >= 10).mean()*100),
+    ).reset_index()
+    g["구간"] = g["구간"].astype(str)
+    for c in ["변수평균","평균수익률","승률","대박률"]:
+        g[c] = g[c].round(2)
+    return g
+
 def choose_universe(listing, n):
     if n >= len(listing):
         return listing.copy()
@@ -414,7 +521,7 @@ FROZEN_ACTIVATION = 2.0
 FROZEN_TRAIL = 2.0
 
 with st.sidebar:
-    st.header("v10.2 검증 설정")
+    st.header("v10.3 분석 설정")
     end_date = st.date_input("종료일", date(2026, 7, 31))
     years = st.selectbox("검증 기간", [3, 4, 5], index=2, format_func=lambda x: f"{x}년")
     universe_n = st.selectbox("검증 종목 수", [300, 500, 700], index=1)
@@ -440,12 +547,12 @@ with st.sidebar:
     st.subheader("OOS")
     train_ratio = st.slider("앞 구간(IS) 비율(%)", 50, 80, 60, 5)
 
-    run = st.button("▶ v10.2 실전 검증", type="primary", use_container_width=True)
+    run = st.button("▶ v10.3 진입특성 분석", type="primary", use_container_width=True)
 
 st.info(
-    "전략 파라미터는 더 최적화하지 않습니다. "
-    "E1 돌파당일 + 활성 +2% + 트레일 2%를 고정하고 "
-    "비용 차감 후 성과, MDD, 연속손실, 시간순 OOS, 연도별 Walk-Forward를 확인합니다."
+    "전략과 청산은 그대로 고정합니다. "
+    "이번 버전은 대박(+10% 이상), 일반 수익, 손절/손실 거래의 진입 당시 특성을 비교해 "
+    "다음 버전에 넣을 필터 후보를 찾는 분석판입니다."
 )
 
 if run:
@@ -539,6 +646,7 @@ if run:
         row.pop("_entry_i", None)
         row.pop("_eval_i", None)
         row.update(ev)
+        row.update(entry_features(d, setup, entry))
         rows.append(row)
 
         if len(setup_df):
@@ -688,12 +796,49 @@ if run:
         use_container_width=True
     )
 
+    st.subheader("⑨ v10.3 · 진입특성 비교")
+    t["결과군"] = t["순수익률(%)"].apply(classify_trade)
+    features = [
+        "진입거래대금(억)", "진입거래량배수20", "진입5일선이격(%)", "진입20일선이격(%)", "진입60일선이격(%)",
+        "20일선5일기울기(%)", "전고점20이격(%)", "전고점60이격(%)", "돌파봉등락률(%)", "돌파봉종가위치(%)",
+        "돌파봉거래대금(억)", "돌파봉거래량배수20", "돌파거래량vs눌림(배)", "돌파종가수익률(%)",
+        "기준봉상승률(%)", "기준봉거래량배수", "기준봉거래대금(억)", "눌림깊이(%)"
+    ]
+    features = [f for f in features if f in t.columns]
+
+    group_counts = t["결과군"].value_counts().reindex(["대박(+10%↑)", "수익(0~10%)", "손절/손실"]).fillna(0).astype(int).reset_index()
+    group_counts.columns = ["결과군", "건수"]
+    st.dataframe(group_counts, use_container_width=True, hide_index=True)
+
+    comp = standardized_group_compare(t, features)
+    st.caption("표준화차이의 절대값이 클수록 대박군과 손실군을 구분할 가능성이 큽니다. 양수면 대박군이 높고, 음수면 대박군이 낮습니다.")
+    st.dataframe(comp, use_container_width=True, hide_index=True)
+
+    st.subheader("⑩ 변수별 4구간 성과")
+    selected_feature = st.selectbox("세부 분석 변수", features)
+    band = quartile_feature_performance(t, selected_feature)
+    st.dataframe(band, use_container_width=True, hide_index=True)
+
+    st.subheader("⑪ 상위 구분 변수 자동 요약")
+    top_vars = comp.dropna(subset=["대박-손실 표준화차이"]).head(5).copy()
+    if top_vars.empty:
+        st.warning("구분력이 계산된 변수가 없습니다.")
+    else:
+        st.dataframe(top_vars[["변수","대박평균","수익평균","손실평균","대박-손실 표준화차이"]], use_container_width=True, hide_index=True)
+
+    st.subheader("⑫ 거래별 진입특성 원자료")
+    raw_cols = ["진입일","시장","종목명","코드","결과군","순수익률(%)","MFE(%)","MAE(%)"] + features
+    st.dataframe(t[[c for c in raw_cols if c in t.columns]].sort_values("순수익률(%)", ascending=False), use_container_width=True, hide_index=True)
+
+    st.download_button("v10.3 진입특성 비교 CSV", comp.to_csv(index=False).encode("utf-8-sig"), "swing_v10_3_entry_feature_compare.csv", "text/csv", use_container_width=True)
+    st.download_button("v10.3 거래별 진입특성 CSV", t.to_csv(index=False).encode("utf-8-sig"), "swing_v10_3_entry_feature_trades.csv", "text/csv", use_container_width=True)
+
     if errors:
         with st.expander(f"조회 실패 {len(errors)}건"):
             st.write(errors)
 
 st.caption(
-    "v10.2는 전략 최적화판이 아니라 검증판입니다. "
-    "E1 돌파당일 + 활성 +2% + 트레일 2%를 고정합니다. "
-    "일봉에서 같은 날 손절과 목표가가 함께 관측되면 손절 우선으로 보수 처리합니다."
+    "v10.3은 진입특성 분석판입니다. "
+    "E1 돌파당일 + 활성 +2% + 트레일 2% 및 기존 기본필터를 그대로 유지합니다. "
+    "분석 결과를 보고 다음 버전에서 실제 필터 후보를 별도 검증합니다."
 )
