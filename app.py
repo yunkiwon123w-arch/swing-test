@@ -5,9 +5,9 @@ import time
 from datetime import date
 from io import BytesIO
 
-st.set_page_config(page_title="단기스윙 v11.1 고승률 연구", layout="wide")
-st.title("🎯 단기스윙 v11.1 · 승률 우선 + 수익률 동시 탐색")
-st.caption("v10.5는 봉인 · KOSPI/KOSDAQ 균형 개발표본 · 승률 최우선, 수익률/PF/MDD 동시 평가")
+st.set_page_config(page_title="단기스윙 v11.2 KOSPI 고승률 연구", layout="wide")
+st.title("🎯 단기스윙 v11.2 · KOSPI 고승률 집중 분석")
+st.caption("F1+F2 유지 · KOSPI 안에서 승률을 더 높이는 단일 필터 탐색 · KOSDAQ은 비교군으로 보존")
 
 # ============================================================
 # 완전 동결된 전략값
@@ -281,22 +281,25 @@ def setup_features(d, setup):
 
 
 def candidate_rules():
-    """해석 가능한 단순 컷만 탐색. 지나치게 촘촘한 파라미터 탐색은 피한다."""
+    """KOSPI 내부에서 단일 추가필터만 탐색한다."""
     return {
-        "C1 KOSPI": lambda d: d["시장"].eq("KOSPI"),
-        "C2 돌파종가≥7%": lambda d: d["돌파종가수익률(%)"] >= 7.0,
+        "C1 돌파종가≥7%": lambda d: d["돌파종가수익률(%)"] >= 7.0,
+        "C2 돌파종가≥10%": lambda d: d["돌파종가수익률(%)"] >= 10.0,
         "C3 돌파봉상승≥8%": lambda d: d["돌파봉등락률(%)"] >= 8.0,
         "C4 종가위치≥70%": lambda d: d["돌파봉종가위치(%)"] >= 70.0,
-        "C5 윗꼬리≤25%": lambda d: d["돌파봉윗꼬리비율(%)"] <= 25.0,
-        "C6 갭≤5%": lambda d: d["돌파갭(%)"] <= 5.0,
-        "C7 거래대금≥1500억": lambda d: d["돌파거래대금(억)"] >= 1500.0,
-        "C8 거래량20≥2배": lambda d: d["돌파거래량배수20"] >= 2.0,
-        "C9 5일이격≥7%": lambda d: d["진입5일선이격(%)"] >= 7.0,
-        "C10 MA20기울기>0": lambda d: d["20일선5일기울기(%)"] > 0.0,
-        "C11 전고점60≥-2%": lambda d: d["전고점60이격(%)"] >= -2.0,
-        "C12 눌림깊이≥-8%": lambda d: d["눌림깊이(%)"] >= -8.0,
-        "C13 눌림기간≤3일": lambda d: d["눌림기간"] <= 3,
-        "C14 기준봉저가유지": lambda d: d["기준봉후유지율(%)"] >= 0.0,
+        "C5 종가위치50~85%": lambda d: d["돌파봉종가위치(%)"].between(50.0, 85.0),
+        "C6 윗꼬리≤20%": lambda d: d["돌파봉윗꼬리비율(%)"] <= 20.0,
+        "C7 갭≤3%": lambda d: d["돌파갭(%)"] <= 3.0,
+        "C8 거래대금≥2000억": lambda d: d["돌파거래대금(억)"] >= 2000.0,
+        "C9 거래량20≥2배": lambda d: d["돌파거래량배수20"] >= 2.0,
+        "C10 5일이격≥7%": lambda d: d["진입5일선이격(%)"] >= 7.0,
+        "C11 5일이격5~15%": lambda d: d["진입5일선이격(%)"].between(5.0, 15.0),
+        "C12 MA20기울기>0": lambda d: d["20일선5일기울기(%)"] > 0.0,
+        "C13 전고점60≥-2%": lambda d: d["전고점60이격(%)"] >= -2.0,
+        "C14 눌림깊이≥-5%": lambda d: d["눌림깊이(%)"] >= -5.0,
+        "C15 눌림깊이0~8%": lambda d: d["눌림깊이(%)"].between(0.0, 8.0),
+        "C16 눌림기간≤3일": lambda d: d["눌림기간"] <= 3,
+        "C17 기준봉저가유지": lambda d: d["기준봉후유지율(%)"] >= 0.0,
     }
 
 
@@ -322,35 +325,29 @@ def apply_named_rules(df, names, rules):
     return df[mask].copy()
 
 
-def search_high_winrate(df, min_trades=30):
+def search_high_winrate(df, min_trades=20):
     rules = candidate_rules()
     rows = []
 
-    # baseline F1+F2
     s = performance_stats(df)
-    rows.append({"조건": "기준 F1+F2", "추가조건수": 0, **s,
-                 "점수": score_candidate(s, min_trades)})
+    rows.append({
+        "조건": "기준 F1+F2 KOSPI",
+        "추가조건수": 0,
+        **s,
+        "점수": score_candidate(s, min_trades)
+    })
 
-    names = list(rules.keys())
-
-    # single conditions
-    for name in names:
+    for name in rules:
         q = apply_named_rules(df, [name], rules)
         s = performance_stats(q)
-        rows.append({"조건": name, "추가조건수": 1, **s,
-                     "점수": score_candidate(s, min_trades)})
+        rows.append({
+            "조건": name,
+            "추가조건수": 1,
+            **s,
+            "점수": score_candidate(s, min_trades)
+        })
 
-    # two-condition combinations only: limits overfitting
-    for i in range(len(names)):
-        for j in range(i + 1, len(names)):
-            pair = [names[i], names[j]]
-            q = apply_named_rules(df, pair, rules)
-            s = performance_stats(q)
-            rows.append({"조건": " + ".join(pair), "추가조건수": 2, **s,
-                         "점수": score_candidate(s, min_trades)})
-
-    out = pd.DataFrame(rows)
-    out = out.sort_values(
+    out = pd.DataFrame(rows).sort_values(
         ["점수", "승률(%)", "평균수익률(%)", "신호"],
         ascending=[False, False, False, False]
     ).reset_index(drop=True)
@@ -359,7 +356,7 @@ def search_high_winrate(df, min_trades=30):
 
 
 def parse_condition_name(label, rules):
-    if label == "기준 F1+F2":
+    if label in ["기준 F1+F2", "기준 F1+F2 KOSPI"]:
         return []
     return [x.strip() for x in label.split(" + ") if x.strip() in rules]
 
@@ -879,18 +876,18 @@ def balanced_development_universe(listing, total_n):
 # UI
 # ============================================================
 with st.sidebar:
-    st.header("v11.1 연구 설정")
+    st.header("v11.2 연구 설정")
     end_date = st.date_input("종료일", date(2026, 7, 31))
     years = st.selectbox("개발 기간", [3, 4, 5], index=2, format_func=lambda x: f"{x}년")
     universe_n = st.selectbox("개발 종목 수", [300, 500], index=1)
     min_trades = st.number_input("후보 최소 거래수", 20, 80, 30, 5)
     train_ratio = st.slider("조건탐색 IS 비율(%)", 50, 75, 60, 5)
-    run = st.button("▶ v11.1 고승률 조건 탐색", type="primary", use_container_width=True)
+    run = st.button("▶ v11.2 KOSPI 조건 탐색", type="primary", use_container_width=True)
 
 st.info(
-    "v10.5 최종 독립검증 전략은 그대로 봉인합니다. "
-    "v11.1은 KOSPI/KOSDAQ을 균형 표본으로 구성해 F1+F2를 출발점으로 손절 가능성이 높은 거래를 걸러냅니다. "
-    "조건은 앞쪽 IS에서만 순위를 정하고, 뒤쪽 OOS에는 선택된 조건을 그대로 적용합니다."
+    "v10.5와 v11.1 결과는 그대로 보존합니다. "
+    "v11.2에서는 F1+F2 거래 중 KOSPI만 대상으로 승률을 더 높이는 단일 추가필터를 찾습니다. "
+    "필터 선택은 KOSPI IS에서만 하고, KOSPI OOS에 그대로 적용합니다."
 )
 
 if run:
@@ -984,22 +981,33 @@ if run:
 
     status.success(f"완료 · 개발군 {total}종목 · F1+F2 거래 {len(trades)}건")
 
-    # IMPORTANT: split BEFORE searching conditions.
-    is_df, oos_df, split_date = fixed_time_split(trades, train_ratio/100.0)
-    if oos_df.empty:
-        st.warning("OOS 분할 표본이 부족합니다.")
+    kospi_trades = trades[trades["시장"] == "KOSPI"].copy()
+    kosdaq_trades = trades[trades["시장"] == "KOSDAQ"].copy()
+
+    if len(kospi_trades) < 20:
+        st.warning("KOSPI 거래 표본이 너무 적습니다.")
         st.stop()
 
-    st.subheader("① 기준 F1+F2")
+    # KOSPI만 시간순 분할 후 IS에서 조건 선택
+    is_df, oos_df, split_date = fixed_time_split(kospi_trades, train_ratio/100.0)
+    if oos_df.empty:
+        st.warning("KOSPI OOS 분할 표본이 부족합니다.")
+        st.stop()
+
+    st.subheader("① 기준 F1+F2 · 전체/KOSPI/KOSDAQ")
     base_all = performance_stats(trades)
+    base_kp = performance_stats(kospi_trades)
+    base_kq = performance_stats(kosdaq_trades)
     base_is = performance_stats(is_df)
     base_oos = performance_stats(oos_df)
     st.dataframe(pd.DataFrame([
         {"구간":"전체", **base_all},
-        {"구간":"IS 조건탐색", **base_is},
-        {"구간":"OOS 미사용", **base_oos},
+        {"구간":"KOSPI 전체", **base_kp},
+        {"구간":"KOSDAQ 전체", **base_kq},
+        {"구간":"KOSPI IS", **base_is},
+        {"구간":"KOSPI OOS", **base_oos},
     ]), use_container_width=True, hide_index=True)
-    st.write(f"**OOS 시작일:** {split_date}")
+    st.write(f"**KOSPI OOS 시작일:** {split_date}")
 
     st.subheader("② 기준전략 시장별 성과")
     market_base_rows = []
@@ -1011,7 +1019,7 @@ if run:
     market_base_df = pd.DataFrame(market_base_rows)
     st.dataframe(market_base_df, use_container_width=True, hide_index=True)
 
-    st.subheader("③ IS에서만 고승률 조건 탐색")
+    st.subheader("③ KOSPI IS에서 단일 고승률 필터 탐색")
     search_df, rules = search_high_winrate(is_df, int(min_trades))
     st.caption(
         "점수는 승률을 가장 크게 반영하되 평균수익률·PF·MDD·표본수를 함께 봅니다. "
@@ -1030,9 +1038,9 @@ if run:
 
     is_winner = apply_named_rules(is_df, chosen_names, rules)
     oos_winner = apply_named_rules(oos_df, chosen_names, rules)
-    all_winner = apply_named_rules(trades, chosen_names, rules)
+    all_winner = apply_named_rules(kospi_trades, chosen_names, rules)
 
-    st.subheader("④ IS 1위 조건 → OOS 고정 검증")
+    st.subheader("④ KOSPI IS 1위 → KOSPI OOS 고정 검증")
     st.write(f"**선택 조건:** {winner_name}")
 
     compare = pd.DataFrame([
@@ -1044,7 +1052,7 @@ if run:
 
     oos_s = performance_stats(oos_winner)
     pass_oos = (
-        oos_s["신호"] >= max(15, int(min_trades*0.4))
+        oos_s["신호"] >= 10
         and oos_s["승률(%)"] >= 60.0
         and oos_s["평균수익률(%)"] >= 3.0
         and oos_s["ProfitFactor"] is not None
@@ -1064,7 +1072,7 @@ if run:
             "60% 승률 목표를 충족하지 못하면 이 조건을 최종전략으로 채택하지 않습니다."
         )
 
-    st.subheader("⑤ 상위 10개 후보의 OOS 실제 성과")
+    st.subheader("⑤ 상위 후보의 KOSPI OOS 실제 성과")
     oos_rows = []
     for _, rr in valid.head(10).iterrows():
         nm = rr["조건"]
@@ -1090,23 +1098,14 @@ if run:
     yr = yearly_stats(all_winner)
     st.dataframe(yr, use_container_width=True, hide_index=True)
 
-    st.subheader("⑦ 1위 조건 시장별")
-    mk = market_stats(all_winner)
+    st.subheader("⑦ KOSPI 1위 조건 vs KOSDAQ 기준전략")
+    mk = pd.DataFrame([
+        {"구분":"KOSPI 1위 조건", **performance_stats(all_winner)},
+        {"구분":"KOSDAQ F1+F2 기준", **performance_stats(kosdaq_trades)},
+    ])
     st.dataframe(mk, use_container_width=True, hide_index=True)
 
-    st.subheader("⑦-1 1위 조건 · 시장별 IS/OOS")
-    market_oos_rows = []
-    for market in ["KOSPI", "KOSDAQ"]:
-        qis = is_winner[is_winner["시장"] == market].copy()
-        qoos = oos_winner[oos_winner["시장"] == market].copy()
-        if not qis.empty:
-            market_oos_rows.append({"시장": market, "구간": "IS", **performance_stats(qis)})
-        if not qoos.empty:
-            market_oos_rows.append({"시장": market, "구간": "OOS", **performance_stats(qoos)})
-    market_oos_df = pd.DataFrame(market_oos_rows)
-    st.dataframe(market_oos_df, use_container_width=True, hide_index=True)
-
-    st.subheader("⑧ 1위 조건 시장국면별")
+    st.subheader("⑧ KOSPI 1위 조건 시장국면별")
     rg = regime_stats(all_winner)
     st.dataframe(rg, use_container_width=True, hide_index=True)
 
@@ -1142,31 +1141,38 @@ if run:
     frozen_df = pd.DataFrame([
         {"항목":"기준전략","값":"v10.5 F1+F2"},
         {"항목":"목적함수","값":"승률 최우선 + 평균수익률/PF/MDD/표본수"},
-        {"항목":"탐색범위","값":"단일 추가조건 + 2조건 조합"},
+        {"항목":"탐색범위","값":"KOSPI 단일 추가조건만"},
         {"항목":"OOS 원칙","값":"시간분할 후 IS에서만 조건 선택"},
         {"항목":"최소거래수","값":int(min_trades)},
         {"항목":"IS비율","값":f"{train_ratio}%"},
     ])
     excel_bytes = build_excel({
         "00_연구설정": frozen_df,
-        "01_기준성과": pd.DataFrame([{"구간":"전체",**base_all},{"구간":"IS",**base_is},{"구간":"OOS",**base_oos}]),
+        "01_기준성과": pd.DataFrame([
+            {"구간":"전체",**base_all},
+            {"구간":"KOSPI전체",**base_kp},
+            {"구간":"KOSDAQ전체",**base_kq},
+            {"구간":"KOSPI_IS",**base_is},
+            {"구간":"KOSPI_OOS",**base_oos}
+        ]),
         "02_IS후보전체": search_df,
         "03_1위_IS_OOS": compare,
         "04_상위10_OOS": oos_compare,
         "05_기준시장별": market_base_df,
         "06_1위연도별": yr,
         "07_1위시장별": mk,
-        "08_1위시장IS_OOS": market_oos_df,
-        "09_1위시장국면": rg,
+                "09_1위시장국면": rg,
         "10_1위아웃라이어": stress,
         "11_승패특성": feat_df,
         "12_전체F1F2거래": trades,
+        "12A_KOSPI기준거래": kospi_trades,
+        "12B_KOSDAQ기준거래": kosdaq_trades,
         "13_1위조건거래": all_winner,
     })
     st.download_button(
-        "📦 v11.1 전체 연구결과 Excel 다운로드",
+        "📦 v11.2 전체 연구결과 Excel 다운로드",
         data=excel_bytes,
-        file_name="swing_v11_1_balanced_high_winrate_research.xlsx",
+        file_name="swing_v11_2_kospi_high_winrate_research.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
@@ -1176,6 +1182,6 @@ if run:
             st.write(errors)
 
 st.caption(
-    "v11.1은 KOSPI/KOSDAQ 균형 연구 브랜치입니다. v10.5 독립검증 결과는 변경하지 않습니다. "
+    "v11.2는 KOSPI 고승률 집중 연구 브랜치입니다. v10.5/v11.1 결과는 변경하지 않습니다. "
     "여기서 발견된 조건도 곧바로 실전 채택하지 않고, 다음 단계에서 다시 완전히 독립된 종목군으로 검증해야 합니다."
 )
