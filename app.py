@@ -3,6 +3,7 @@ import pandas as pd
 import FinanceDataReader as fdr
 import time
 from datetime import date
+from io import BytesIO
 
 st.set_page_config(page_title="단기스윙 백테스트 v10.4", layout="wide")
 st.title("🧪 단기스윙 v10 · E1+X3 엣지 검증")
@@ -608,6 +609,26 @@ def holdout_filter_compare(df, filter_name, train_ratio=0.60):
         rows.append({"구간": "OOS", **evaluate_subset(test)})
     return pd.DataFrame(rows), split_date
 
+def build_full_excel(sheets):
+    """화면의 주요 분석 결과를 Excel 여러 시트로 묶어 반환한다."""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for sheet_name, df in sheets.items():
+            if df is None:
+                continue
+            if not isinstance(df, pd.DataFrame):
+                df = pd.DataFrame(df)
+            safe_name = str(sheet_name)[:31]
+            df.to_excel(writer, sheet_name=safe_name, index=False)
+            ws = writer.book[safe_name]
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            for col_cells in ws.columns:
+                width = min(max(len(str(c.value)) if c.value is not None else 0 for c in col_cells) + 2, 40)
+                ws.column_dimensions[col_cells[0].column_letter].width = max(width, 10)
+    output.seek(0)
+    return output.getvalue()
+
 def choose_universe(listing, n):
     if n >= len(listing):
         return listing.copy()
@@ -1022,6 +1043,37 @@ if run:
             "text/csv",
             use_container_width=True
         )
+
+        st.subheader("⑲ 전체 분석결과 Excel")
+        excel_sheets = {
+            "01_비용전후": compare,
+            "02_OOS_Holdout": oos_table if split_date is not None else pd.DataFrame(),
+            "03_WalkForward": wf,
+            "04_Equity_MDD": eq_show,
+            "05_아웃라이어": pd.DataFrame(stress),
+            "06_연도별성과": pd.DataFrame(yr).sort_values("연도"),
+            "07_종목별의존도": stock_df,
+            "08_전체거래": t,
+            "09_진입특성비교": comp,
+            "10_선택변수4구간": band,
+            "11_상위구분변수": top_vars,
+            "12_거래별진입특성": t[[c for c in raw_cols if c in t.columns]],
+            "13_필터성과비교": filter_comp,
+            "14_1위필터연도별": yrf,
+            "15_1위필터OOS": hdf,
+            "16_상위3필터OOS": pd.DataFrame(oos_rows),
+            "17_거래량이상치": diag if "돌파거래량vs눌림(배)" in t.columns else pd.DataFrame(),
+        }
+        excel_bytes = build_full_excel(excel_sheets)
+        st.download_button(
+            "📦 v10.4 전체 분석결과 Excel 다운로드",
+            data=excel_bytes,
+            file_name="swing_v10_4_full_analysis.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            type="primary"
+        )
+        st.caption("이 Excel 하나를 ChatGPT에 올리면 전체 거래·OOS·연도별·진입특성·필터 결과를 한 번에 공유할 수 있습니다.")
 
     if errors:
         with st.expander(f"조회 실패 {len(errors)}건"):
