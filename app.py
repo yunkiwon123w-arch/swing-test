@@ -4,7 +4,7 @@ import FinanceDataReader as fdr
 import time
 from datetime import date
 
-st.set_page_config(page_title="단기스윙 백테스트 v10", layout="wide")
+st.set_page_config(page_title="단기스윙 백테스트 v10.1", layout="wide")
 st.title("🧪 단기스윙 v10 · E1+X3 엣지 검증")
 st.caption("v9 1위 E1 돌파당일 + X3 트레일 고정 · 표본확대 · 아웃라이어/연도/종목/트레일 민감도 검증")
 
@@ -314,7 +314,7 @@ ENTRY_MODE = "E1 돌파당일"
 EXIT_MODE = "X3 +3%후트레일"
 
 with st.sidebar:
-    st.header("v10 검증 설정")
+    st.header("v10.1 검증 설정")
     end_date = st.date_input("종료일", date(2026, 7, 31))
     years = st.selectbox("검증 기간", [2, 3, 4, 5], index=3, format_func=lambda x: f"{x}년")
     universe_n = st.selectbox("검증 종목 수", [200, 300, 500, 700], index=2)
@@ -332,7 +332,7 @@ with st.sidebar:
     st.subheader("X3 민감도")
     activation_list = st.multiselect("트레일 활성화 수익률(%)", [2.0, 3.0, 4.0, 5.0], default=[2.0,3.0,4.0,5.0])
     trail_list = st.multiselect("트레일 폭(%)", [2.0, 3.0, 4.0], default=[2.0,3.0,4.0])
-    run = st.button("▶ v10 강건성 검증", type="primary", use_container_width=True)
+    run = st.button("▶ v10.1 강건성 검증", type="primary", use_container_width=True)
 
 st.info("핵심 검증: 500종목·5년 / E1 돌파당일 고정 / X3 활성화 2·3·4·5% × 트레일 2·3·4% / 최고수익 거래 제거 / 연도별·종목별 분해")
 
@@ -367,14 +367,23 @@ if run:
         code, name, market = str(r["Code"]).zfill(6), r["Name"], r["Market"]
         status.write(f"데이터/신호 탐색 {pos}/{total} · {name}")
         try:
-            d = load_data(code, start_ts.date(), fetch_end.date())
-            if d is None or len(d) < 80:
+            d = load_data(
+                code,
+                start_ts.strftime("%Y-%m-%d"),
+                fetch_end.strftime("%Y-%m-%d")
+            )
+            if d is None or d.empty or len(d) < 80:
                 continue
-            d = add_indicators(d)
-            data_map[code] = d
-            found = find_setups(d, code, name, market, cut, end_ts, base_p)
-            if found is not None and len(found):
-                setups.extend(found.to_dict("records"))
+
+            # find_setups 내부에서 지표를 계산하므로 원본 d를 전달한다.
+            found_rows, prepared = find_setups(
+                d, code, name, market, base_p, cut, end_ts
+            )
+
+            data_map[code] = prepared
+
+            if found_rows:
+                setups.extend(found_rows)
         except Exception as e:
             errors.append(f"{name}({code}): {type(e).__name__}")
         bar.progress(pos / total)
