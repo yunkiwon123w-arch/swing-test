@@ -4,9 +4,9 @@ import FinanceDataReader as fdr
 import time
 from datetime import date
 
-st.set_page_config(page_title="단기스윙 백테스트 v10.3", layout="wide")
+st.set_page_config(page_title="단기스윙 백테스트 v10.4", layout="wide")
 st.title("🧪 단기스윙 v10 · E1+X3 엣지 검증")
-st.caption("전략/청산 고정 · 대박/수익/손절 거래의 진입 당시 특성을 비교해 유효 필터 후보 탐색")
+st.caption("v10.3 상위 진입특성 기반 · 단독 필터/2개 조합/OOS/연도별 강건성 검증")
 
 TARGETS = [3.0, 5.0, 7.0, 10.0]
 
@@ -507,6 +507,107 @@ def quartile_feature_performance(df, feature):
         g[c] = g[c].round(2)
     return g
 
+def winsorize_series(s, lower=0.01, upper=0.99):
+    q = s.dropna()
+    if q.empty:
+        return s
+    lo = q.quantile(lower)
+    hi = q.quantile(upper)
+    return s.clip(lo, hi)
+
+def filter_rule_mask(df, rule_name):
+    """v10.3에서 발견된 상위 4개 후보를 과도하게 세밀 조정하지 않고
+    단순/해석 가능한 컷으로 검증한다.
+    """
+    if rule_name == "F1 돌파강도":
+        # 돌파종가수익률이 강한 모멘텀 구간
+        return df["돌파종가수익률(%)"] >= 5.0
+
+    if rule_name == "F2 전고점20":
+        # 최근 20일 전고점 근처 또는 돌파
+        return df["전고점20이격(%)"] >= -2.0
+
+    if rule_name == "F3 5일선이격":
+        # 단기 모멘텀 유지
+        return df["진입5일선이격(%)"] >= 5.0
+
+    if rule_name == "F4 전고점60":
+        # 60일 전고점에서 크게 멀지 않은 종목
+        return df["전고점60이격(%)"] >= -5.0
+
+    return pd.Series(True, index=df.index)
+
+def evaluate_subset(df, ret_col="순수익률(%)"):
+    if df.empty:
+        return {
+            "신호": 0, "승률(%)": 0.0, "평균수익률(%)": 0.0, "중앙수익률(%)": 0.0,
+            "MDD(%)": 0.0, "최대연속손실": 0, "ProfitFactor": None,
+            "누적복리수익률(%)": 0.0
+        }
+    return performance_stats(df, ret_col)
+
+def build_filter_comparison(df):
+    rules = ["F1 돌파강도", "F2 전고점20", "F3 5일선이격", "F4 전고점60"]
+    rows = []
+
+    base = evaluate_subset(df)
+    rows.append({"필터": "기본전략", "구성": "없음", **base})
+
+    for r in rules:
+        q = df[filter_rule_mask(df, r)].copy()
+        rows.append({"필터": r, "구성": r, **evaluate_subset(q)})
+
+    for i in range(len(rules)):
+        for j in range(i + 1, len(rules)):
+            r1, r2 = rules[i], rules[j]
+            mask = filter_rule_mask(df, r1) & filter_rule_mask(df, r2)
+            q = df[mask].copy()
+            rows.append({
+                "필터": f"{r1}+{r2}",
+                "구성": f"{r1} & {r2}",
+                **evaluate_subset(q)
+            })
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(
+            ["평균수익률(%)", "ProfitFactor", "MDD(%)", "신호"],
+            ascending=[False, False, False, False]
+        ).reset_index(drop=True)
+        out.insert(0, "순위", range(1, len(out) + 1))
+    return out
+
+def yearly_filter_compare(df, filter_name):
+    if filter_name == "기본전략":
+        q = df.copy()
+    elif "+" in filter_name:
+        a, b = filter_name.split("+", 1)
+        q = df[filter_rule_mask(df, a) & filter_rule_mask(df, b)].copy()
+    else:
+        q = df[filter_rule_mask(df, filter_name)].copy()
+
+    q["연도"] = pd.to_datetime(q["진입일"]).dt.year
+    rows = []
+    for y, g in q.groupby("연도"):
+        rows.append({"연도": int(y), **evaluate_subset(g)})
+    return pd.DataFrame(rows).sort_values("연도") if rows else pd.DataFrame()
+
+def holdout_filter_compare(df, filter_name, train_ratio=0.60):
+    if filter_name == "기본전략":
+        q = df.copy()
+    elif "+" in filter_name:
+        a, b = filter_name.split("+", 1)
+        q = df[filter_rule_mask(df, a) & filter_rule_mask(df, b)].copy()
+    else:
+        q = df[filter_rule_mask(df, filter_name)].copy()
+
+    train, test, split_date = chronological_oos(q, train_ratio)
+    rows = []
+    if split_date is not None:
+        rows.append({"구간": "IS", **evaluate_subset(train)})
+        rows.append({"구간": "OOS", **evaluate_subset(test)})
+    return pd.DataFrame(rows), split_date
+
 def choose_universe(listing, n):
     if n >= len(listing):
         return listing.copy()
@@ -521,7 +622,7 @@ FROZEN_ACTIVATION = 2.0
 FROZEN_TRAIL = 2.0
 
 with st.sidebar:
-    st.header("v10.3 분석 설정")
+    st.header("v10.4 검증 설정")
     end_date = st.date_input("종료일", date(2026, 7, 31))
     years = st.selectbox("검증 기간", [3, 4, 5], index=2, format_func=lambda x: f"{x}년")
     universe_n = st.selectbox("검증 종목 수", [300, 500, 700], index=1)
@@ -547,12 +648,12 @@ with st.sidebar:
     st.subheader("OOS")
     train_ratio = st.slider("앞 구간(IS) 비율(%)", 50, 80, 60, 5)
 
-    run = st.button("▶ v10.3 진입특성 분석", type="primary", use_container_width=True)
+    run = st.button("▶ v10.4 진입필터 검증", type="primary", use_container_width=True)
 
 st.info(
-    "전략과 청산은 그대로 고정합니다. "
-    "이번 버전은 대박(+10% 이상), 일반 수익, 손절/손실 거래의 진입 당시 특성을 비교해 "
-    "다음 버전에 넣을 필터 후보를 찾는 분석판입니다."
+    "전략/청산/비용은 그대로 고정합니다. "
+    "v10.3에서 구분력이 높았던 4개 진입특성만 단독 및 2개 조합으로 검증하고, "
+    "OOS와 연도별 성과까지 비교합니다."
 )
 
 if run:
@@ -833,12 +934,101 @@ if run:
     st.download_button("v10.3 진입특성 비교 CSV", comp.to_csv(index=False).encode("utf-8-sig"), "swing_v10_3_entry_feature_compare.csv", "text/csv", use_container_width=True)
     st.download_button("v10.3 거래별 진입특성 CSV", t.to_csv(index=False).encode("utf-8-sig"), "swing_v10_3_entry_feature_trades.csv", "text/csv", use_container_width=True)
 
+
+    st.subheader("⑬ v10.4 · 진입필터 성과 비교")
+
+    # 이상치 보정용 진단 컬럼: 필터 기준 자체에는 사용하지 않고 참고용으로만 제공
+    if "돌파거래량vs눌림(배)" in t.columns:
+        t["돌파거래량vs눌림_윈저"] = winsorize_series(
+            pd.to_numeric(t["돌파거래량vs눌림(배)"], errors="coerce")
+        )
+
+    filter_comp = build_filter_comparison(t)
+    st.caption(
+        "필터 컷은 v10.3 결과를 바탕으로 단순하게 고정했습니다. "
+        "F1=돌파종가수익률≥5%, F2=20일 전고점 이격≥-2%, "
+        "F3=5일선 이격≥5%, F4=60일 전고점 이격≥-5%."
+    )
+    st.dataframe(filter_comp, use_container_width=True, hide_index=True)
+
+    if not filter_comp.empty:
+        top_filter = filter_comp.iloc[0]["필터"]
+        st.subheader("⑭ 현재 1위 필터")
+        top_row = filter_comp.iloc[0]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("신호", int(top_row["신호"]))
+        c2.metric("승률", f'{top_row["승률(%)"]:.1f}%')
+        c3.metric("평균수익률", f'{top_row["평균수익률(%)"]:.2f}%')
+        pf_val = top_row["ProfitFactor"]
+        c4.metric("Profit Factor", "-" if pd.isna(pf_val) else f"{pf_val:.2f}")
+
+        st.write(f"**1위:** {top_filter}")
+
+        st.subheader("⑮ 1위 필터 · 연도별 성과")
+        yrf = yearly_filter_compare(t, top_filter)
+        st.dataframe(yrf, use_container_width=True, hide_index=True)
+
+        st.subheader("⑯ 1위 필터 · 시간순 OOS")
+        hdf, split_date2 = holdout_filter_compare(t, top_filter, train_ratio / 100.0)
+        if split_date2 is not None:
+            st.write(f"**OOS 시작일:** {split_date2}")
+            st.dataframe(hdf, use_container_width=True, hide_index=True)
+
+        st.subheader("⑰ 상위 3개 필터 OOS 비교")
+        oos_rows = []
+        for _, rr in filter_comp.head(3).iterrows():
+            fname = rr["필터"]
+            h, sp = holdout_filter_compare(t, fname, train_ratio / 100.0)
+            if not h.empty:
+                oos = h[h["구간"] == "OOS"]
+                if not oos.empty:
+                    r = oos.iloc[0].to_dict()
+                    oos_rows.append({
+                        "필터": fname,
+                        "OOS시작일": sp,
+                        **{k: v for k, v in r.items() if k != "구간"}
+                    })
+        st.dataframe(pd.DataFrame(oos_rows), use_container_width=True, hide_index=True)
+
+        st.subheader("⑱ 거래량비 이상치 보정 진단")
+        if "돌파거래량vs눌림(배)" in t.columns:
+            raw_s = pd.to_numeric(t["돌파거래량vs눌림(배)"], errors="coerce")
+            win_s = pd.to_numeric(t["돌파거래량vs눌림_윈저"], errors="coerce")
+            diag = pd.DataFrame([
+                {
+                    "구분": "원본",
+                    "평균": round(raw_s.mean(), 2),
+                    "중앙값": round(raw_s.median(), 2),
+                    "95%": round(raw_s.quantile(0.95), 2),
+                    "99%": round(raw_s.quantile(0.99), 2),
+                    "최대": round(raw_s.max(), 2),
+                },
+                {
+                    "구분": "1~99% 윈저",
+                    "평균": round(win_s.mean(), 2),
+                    "중앙값": round(win_s.median(), 2),
+                    "95%": round(win_s.quantile(0.95), 2),
+                    "99%": round(win_s.quantile(0.99), 2),
+                    "최대": round(win_s.max(), 2),
+                }
+            ])
+            st.dataframe(diag, use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "v10.4 필터 비교 CSV",
+            filter_comp.to_csv(index=False).encode("utf-8-sig"),
+            "swing_v10_4_filter_compare.csv",
+            "text/csv",
+            use_container_width=True
+        )
+
     if errors:
         with st.expander(f"조회 실패 {len(errors)}건"):
             st.write(errors)
 
 st.caption(
-    "v10.3은 진입특성 분석판입니다. "
-    "E1 돌파당일 + 활성 +2% + 트레일 2% 및 기존 기본필터를 그대로 유지합니다. "
-    "분석 결과를 보고 다음 버전에서 실제 필터 후보를 별도 검증합니다."
+    "v10.4는 진입필터 검증판입니다. "
+    "청산/비용/기본전략은 고정하고, v10.3에서 발견한 4개 진입특성만 검증합니다. "
+    "단독 및 2개 조합의 전체/OOS/연도별 성과를 비교해 과최적화 위험을 줄입니다."
 )
