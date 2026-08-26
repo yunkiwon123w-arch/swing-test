@@ -5,9 +5,9 @@ import time
 from datetime import date
 from io import BytesIO
 
-st.set_page_config(page_title="단기스윙 v11.5 시장환경 연구", layout="wide")
-st.title("🌐 단기스윙 v11.5 · KOSPI 시장환경 고승률 연구")
-st.caption("종목조건 F1+F2 고정 · KOSPI 지수 추세/이평/수익률/고점이격/변동성으로 승률 개선 구간 탐색")
+st.set_page_config(page_title="단기스윙 v11.6 최종 독립검증", layout="wide")
+st.title("🏁 단기스윙 v11.6 · 최종 독립검증")
+st.caption("조건 탐색 종료 · KOSPI F1+F2 + MA60 10일 기울기≥+0.328% 완전 동결 · 미사용 KOSPI 종목군 최종 검증")
 
 # ============================================================
 # 완전 동결된 전략값
@@ -1454,241 +1454,616 @@ def evaluate_market_top_oos(ranked, oos_df, top_n=12):
         })
     return pd.DataFrame(rows)
 
+
+# ============================================================
+# v11.6 frozen final hypothesis
+# ============================================================
+V116_MA60_SLOPE_CUT = 0.328
+V115_USED_KOSPI_START = 250
+V115_USED_KOSPI_N = 300
+
+def v116_independent_kospi_universe(listing, n):
+    """v11.5에서 사용한 KOSPI 구간(개발 250 제외 후 다음 300)을 제외한 그 이후 종목."""
+    kp = (
+        listing[listing["Market"] == "KOSPI"]
+        .sort_values("Code")
+        .reset_index(drop=True)
+    )
+
+    # v11.3 개발 250 + v11.5 연구 300 = 앞 550개를 모두 제외
+    start = V115_USED_KOSPI_START + V115_USED_KOSPI_N
+    picked = kp.iloc[start:start + int(n)].copy().reset_index(drop=True)
+
+    used = set(kp.iloc[:start]["Code"].astype(str))
+    overlap = set(picked["Code"].astype(str)) & used
+
+    return picked, used, overlap
+
+
+def fixed_v116_market_filter(df):
+    return (
+        pd.to_numeric(
+            df["MA60_10일기울기(%)"],
+            errors="coerce"
+        ) >= V116_MA60_SLOPE_CUT
+    )
+
+
+def compare_v116(df):
+    base = performance_stats(df)
+    filt = performance_stats(
+        df[fixed_v116_market_filter(df)].copy()
+    )
+
+    return pd.DataFrame([
+        {"전략":"KOSPI F1+F2 기준", **base},
+        {
+            "전략":f"F1+F2 + MA60 10일기울기≥{V116_MA60_SLOPE_CUT}%",
+            **filt
+        },
+    ])
+
+
+def v116_time_split_compare(df, ratio=0.60):
+    train, test, split_date = fixed_time_split(df, ratio)
+    rows = []
+
+    for label, part in [("앞 60%", train), ("뒤 40%", test)]:
+        if part.empty:
+            continue
+
+        rows.append({
+            "전략":"기준",
+            "구간":label,
+            **performance_stats(part)
+        })
+
+        fp = part[fixed_v116_market_filter(part)].copy()
+
+        rows.append({
+            "전략":"v11.6 필터",
+            "구간":label,
+            **performance_stats(fp)
+        })
+
+    return pd.DataFrame(rows), split_date
+
+
+def v116_yearly_compare(df):
+    q = df.copy()
+    q["연도"] = pd.to_datetime(q["진입일"]).dt.year
+
+    rows = []
+    for y, g in q.groupby("연도"):
+        rows.append({
+            "연도":int(y),
+            "전략":"기준",
+            **performance_stats(g)
+        })
+
+        gf = g[fixed_v116_market_filter(g)].copy()
+        if not gf.empty:
+            rows.append({
+                "연도":int(y),
+                "전략":"v11.6 필터",
+                **performance_stats(gf)
+            })
+
+    return pd.DataFrame(rows)
+
+
+def v116_stress_compare(df):
+    rows = []
+    for label, q in [
+        ("기준", df.copy()),
+        ("v11.6 필터", df[fixed_v116_market_filter(df)].copy())
+    ]:
+        ordered = q.sort_values("순수익률(%)", ascending=False)
+
+        for n in [0,1,3,5]:
+            z = ordered.iloc[n:].copy() if len(ordered) > n else pd.DataFrame()
+            if z.empty:
+                continue
+
+            rows.append({
+                "전략":label,
+                "최고수익 제거":"제거 없음" if n == 0 else f"상위 {n}건",
+                **performance_stats(z)
+            })
+
+    return pd.DataFrame(rows)
+
+
 # ============================================================
 # UI
 # ============================================================
 with st.sidebar:
-    st.header("v11.5 시장환경 연구 설정")
+    st.header("v11.6 최종 독립검증")
 
-    end_date = st.date_input("종료일", date(2026,7,31))
-    years = st.selectbox("연구 기간",[3,4,5],index=2,format_func=lambda x:f"{x}년")
-    universe_n = st.selectbox("KOSPI 연구 종목 수",[200,300,500],index=1)
-    train_ratio = st.slider("IS 비율(%)",50,75,60,5)
-    min_trades = st.number_input("IS 후보 최소 거래수",10,40,15,5)
+    end_date = st.date_input(
+        "종료일",
+        date(2026,7,31),
+        disabled=True
+    )
 
-    run = st.button("▶ v11.5 시장환경 탐색",type="primary",use_container_width=True)
+    years = st.number_input(
+        "검증 기간(년)",
+        min_value=5,
+        max_value=5,
+        value=5,
+        disabled=True
+    )
+
+    universe_n = st.selectbox(
+        "최종 미사용 KOSPI 종목 수",
+        [150, 200, 250],
+        index=1
+    )
+
+    run = st.button(
+        "▶ v11.6 최종 독립검증 실행",
+        type="primary",
+        use_container_width=True
+    )
 
 st.info(
-    "종목 전략은 KOSPI F1+F2로 고정합니다. "
-    "v11.5는 진입일의 KOSPI 지수 환경만 분석합니다. "
-    "IS에서 시장환경 조건을 찾고 OOS에 그대로 적용하며, 종목 필터는 추가하지 않습니다."
+    "v11.6에서는 조건을 하나도 바꾸지 않습니다. "
+    "KOSPI F1+F2 + KOSPI MA60 10일 기울기 ≥ +0.328%를 완전히 고정하고, "
+    "v11.3/v11.5에 사용한 KOSPI 종목군을 모두 제외한 그 다음 미사용 종목에서만 검증합니다."
 )
 
 if run:
-    end_ts=pd.Timestamp(end_date)
-    cut=end_ts-pd.DateOffset(years=int(years))
-    start_ts=cut-pd.Timedelta(days=150)
-    fetch_end=end_ts+pd.Timedelta(days=45)
+    end_ts = pd.Timestamp(end_date)
+    cut = end_ts - pd.DateOffset(years=int(years))
+    start_ts = cut - pd.Timedelta(days=180)
+    fetch_end = end_ts + pd.Timedelta(days=45)
 
     try:
-        listing=stock_listing()
+        listing = stock_listing()
     except Exception as e:
         st.error(f"종목 목록 조회 실패: {type(e).__name__}")
-        st.exception(e); st.stop()
-
-    # v11.4와 동일한 '미사용 KOSPI' 연구군 사용.
-    universe,used_codes,overlap=independent_kospi_universe(listing,int(universe_n))
-
-    if overlap:
-        st.error(f"표본 오류: 기존 KOSPI 개발군과 {len(overlap)}종목 중복")
+        st.exception(e)
         st.stop()
 
-    progress=st.progress(0); status=st.empty()
-    setups=[]; data_map={}; errors=[]; total=len(universe)
+    universe, used_codes, overlap = v116_independent_kospi_universe(
+        listing,
+        int(universe_n)
+    )
 
-    for pos,(_,r) in enumerate(universe.iterrows(),1):
-        code0=str(r["Code"]).zfill(6); name=r["Name"]
-        status.info(f"1/2 KOSPI 데이터/신호 {pos}/{total} · {name}")
+    if overlap:
+        st.error(
+            f"독립표본 오류: 기존 연구군과 {len(overlap)}종목 중복"
+        )
+        st.stop()
+
+    if universe.empty:
+        st.error(
+            "남은 KOSPI 미사용 종목이 없습니다. "
+            "종목 수를 줄여주세요."
+        )
+        st.stop()
+
+    st.write(
+        f"**최종 독립 KOSPI 표본:** {len(universe)}종목"
+    )
+    st.write(
+        "**기존 v11.3/v11.5 KOSPI 연구군과 중복:** 0종목"
+    )
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    setups = []
+    data_map = {}
+    errors = []
+    total = len(universe)
+
+    for pos, (_, r) in enumerate(universe.iterrows(), 1):
+        code0 = str(r["Code"]).zfill(6)
+        name = r["Name"]
+
+        status.info(
+            f"1/2 최종 독립 KOSPI 데이터/신호 "
+            f"{pos}/{total} · {name}"
+        )
+
         try:
-            d=load_data(code0,start_ts.strftime("%Y-%m-%d"),fetch_end.strftime("%Y-%m-%d"))
-            if d is None or d.empty or len(d)<120: continue
-            found,prepared=find_setups(d,code0,name,"KOSPI",cut,end_ts)
-            data_map[code0]=prepared
-            if found: setups.extend(found)
-        except Exception as e:
-            errors.append(f"{name}({code0}): {type(e).__name__}")
+            d = load_data(
+                code0,
+                start_ts.strftime("%Y-%m-%d"),
+                fetch_end.strftime("%Y-%m-%d")
+            )
 
-        progress.progress(pos/(total*2))
+            if d is None or d.empty or len(d) < 140:
+                continue
+
+            found, prepared = find_setups(
+                d,
+                code0,
+                name,
+                "KOSPI",
+                cut,
+                end_ts
+            )
+
+            data_map[code0] = prepared
+
+            if found:
+                setups.extend(found)
+
+        except Exception as e:
+            errors.append(
+                f"{name}({code0}): {type(e).__name__}"
+            )
+
+        progress.progress(pos / (total * 2))
         time.sleep(0.01)
 
     if not setups:
-        progress.empty(); status.warning("setup이 없습니다."); st.stop()
+        progress.empty()
+        status.warning(
+            "최종 독립군에서 setup이 없습니다."
+        )
+        st.stop()
 
-    setup_df=dedup_setups(pd.DataFrame(setups))
-    selected=setup_df[setup_df.apply(frozen_filter,axis=1)].reset_index(drop=True)
+    setup_df = dedup_setups(
+        pd.DataFrame(setups)
+    )
 
-    rows=[]
-    for idx,(_,setup) in enumerate(selected.iterrows(),1):
-        code0=str(setup["코드"]).zfill(6); d=data_map.get(code0)
-        if d is None: continue
-        entry=make_entry(d,setup)
-        ev=evaluate_trade(d,setup,entry)
+    # 종목조건 F1+F2 완전 고정
+    selected = setup_df[
+        setup_df.apply(
+            frozen_filter,
+            axis=1
+        )
+    ].reset_index(drop=True)
 
-        row=setup.drop(labels=["_b","_pull_i","_breakout_i"],errors="ignore").to_dict()
-        row.update({k:v for k,v in entry.items() if not k.startswith("_")})
+    rows = []
+
+    for idx, (_, setup) in enumerate(selected.iterrows(), 1):
+        code0 = str(setup["코드"]).zfill(6)
+        d = data_map.get(code0)
+
+        if d is None:
+            continue
+
+        entry = make_entry(d, setup)
+        ev = evaluate_trade(d, setup, entry)
+
+        row = setup.drop(
+            labels=[
+                "_b",
+                "_pull_i",
+                "_breakout_i"
+            ],
+            errors="ignore"
+        ).to_dict()
+
+        row.update({
+            k:v for k,v in entry.items()
+            if not k.startswith("_")
+        })
+
         row.update(ev)
-        row.update(setup_features(d,setup))
+        row.update(setup_features(d, setup))
         rows.append(row)
 
         if len(selected):
-            progress.progress(0.5+idx/(len(selected)*2))
+            progress.progress(
+                0.5 + idx / (len(selected) * 2)
+            )
 
     progress.empty()
-    trades=pd.DataFrame(rows)
-    if trades.empty:
-        status.warning("F1+F2 거래가 없습니다."); st.stop()
 
+    trades = pd.DataFrame(rows)
+
+    if trades.empty:
+        status.warning(
+            "최종 독립군에서 F1+F2 거래가 없습니다."
+        )
+        st.stop()
+
+    # KOSPI index market features
     try:
-        ks11=load_benchmark(
+        ks11 = load_benchmark(
             "KS11",
-            (start_ts-pd.Timedelta(days=200)).strftime("%Y-%m-%d"),
+            (start_ts - pd.Timedelta(days=220)).strftime("%Y-%m-%d"),
             fetch_end.strftime("%Y-%m-%d")
         )
     except Exception as e:
-        st.error(f"KOSPI 지수 조회 실패: {type(e).__name__}")
+        st.error(
+            f"KOSPI 지수 조회 실패: {type(e).__name__}"
+        )
         st.stop()
 
     if ks11 is None or ks11.empty:
         st.error("KOSPI 지수 데이터가 없습니다.")
         st.stop()
 
-    trades=attach_kospi_market_features(trades,ks11)
-    status.success(f"완료 · KOSPI {len(universe)}종목 · F1+F2 거래 {len(trades)}건")
-
-    # Split before research
-    is_df,oos_df,split_date=fixed_time_split(trades,train_ratio/100.0)
-    if oos_df.empty:
-        st.warning("OOS 표본이 부족합니다."); st.stop()
-
-    st.subheader("① KOSPI F1+F2 기준성과")
-    baseline_df=pd.DataFrame([
-        {"구간":"전체",**performance_stats(trades)},
-        {"구간":"IS",**performance_stats(is_df)},
-        {"구간":"OOS",**performance_stats(oos_df)},
-    ])
-    st.dataframe(baseline_df,use_container_width=True,hide_index=True)
-    st.write(f"**OOS 시작일:** {split_date}")
-
-    st.subheader("② 승리 vs 손실 · 시장환경 차이")
-    wl_df=market_win_loss_compare(trades)
-    st.dataframe(wl_df,use_container_width=True,hide_index=True)
-
-    st.subheader("③ IS에서 시장환경 고승률 구간 탐색")
-    ranked=search_market_rules_is(is_df,int(min_trades))
-    st.caption(
-        "지수 5/20/60일 수익률, 20/60/120일선 이격, 이평선 기울기, "
-        "60/120일 고점 이격, 20일 변동성의 IS 분위수에서 후보를 자동 생성합니다."
+    trades = attach_kospi_market_features(
+        trades,
+        ks11
     )
-    st.dataframe(ranked.head(40),use_container_width=True,hide_index=True)
 
-    st.subheader("④ 상위 IS 시장조건 → OOS 고정검증")
-    oos_compare=evaluate_market_top_oos(ranked,oos_df,top_n=12)
-    st.dataframe(oos_compare,use_container_width=True,hide_index=True)
+    status.success(
+        f"완료 · 최종 미사용 KOSPI {len(universe)}종목 · "
+        f"F1+F2 거래 {len(trades)}건"
+    )
 
-    eligible=oos_compare[
-        (oos_compare["OOS신호"]>=10)
-        & (oos_compare["OOS승률(%)"]>=60)
-        & (oos_compare["OOS평균(%)"]>0)
-        & (oos_compare["OOS_PF"].fillna(0)>=2.0)
+    filtered = trades[
+        fixed_v116_market_filter(trades)
     ].copy()
 
-    best_rule_row=None
-    filtered_all=pd.DataFrame()
-    filtered_is=pd.DataFrame()
-    filtered_oos=pd.DataFrame()
+    # ========================================================
+    # ① headline
+    # ========================================================
+    st.subheader("① 최종 독립검증 · 기준 vs 고정 시장필터")
 
-    if eligible.empty:
-        st.warning(
-            "OOS에서 승률≥60%, 신호≥10, 평균수익률>0, PF≥2를 동시에 만족한 시장조건이 없습니다. "
-            "시장필터를 억지로 채택하지 않는 것이 맞습니다."
+    compare_df = compare_v116(trades)
+
+    st.dataframe(
+        compare_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    fs = performance_stats(filtered)
+
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("필터 신호", fs["신호"])
+    c2.metric("필터 승률", f'{fs["승률(%)"]:.1f}%')
+    c3.metric("평균 순수익률", f'{fs["평균수익률(%)"]:.2f}%')
+    c4.metric(
+        "PF",
+        "-" if fs["ProfitFactor"] is None
+        else f'{fs["ProfitFactor"]:.2f}'
+    )
+
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("MDD", f'{fs["MDD(%)"]:.2f}%')
+    c2.metric("최대 연속손실", f'{fs["최대연속손실"]}회')
+    c3.metric("중앙수익률", f'{fs["중앙수익률(%)"]:.2f}%')
+    c4.metric("누적복리 진단", f'{fs["누적복리수익률(%)"]:.1f}%')
+
+    # Final pre-registered pass thresholds
+    passed = (
+        fs["신호"] >= 30
+        and fs["승률(%)"] >= 60.0
+        and fs["평균수익률(%)"] >= 5.0
+        and fs["ProfitFactor"] is not None
+        and fs["ProfitFactor"] >= 3.0
+        and fs["MDD(%)"] > -15.0
+    )
+
+    if passed:
+        st.success(
+            "✅ v11.6 최종 독립검증 통과: "
+            "신호≥30 / 승률≥60% / 평균수익률≥5% / "
+            "PF≥3 / MDD>-15%"
         )
     else:
-        best_oos=eligible.sort_values(
-            ["OOS승률(%)","OOS평균(%)","OOS_PF","OOS신호"],
-            ascending=[False,False,False,False]
-        ).iloc[0]
-
-        selected_is_rank=int(best_oos["IS순위"])
-        best_rule_row=ranked[ranked["순위"]==selected_is_rank].iloc[0]
-
-        filtered_all=apply_market_rule(trades,best_rule_row)
-        filtered_is=apply_market_rule(is_df,best_rule_row)
-        filtered_oos=apply_market_rule(oos_df,best_rule_row)
-
-        st.success(
-            f'현재 OOS 최고 시장조건: {best_rule_row["변수"]} / {best_rule_row["조건"]} · '
-            f'승률 {best_oos["OOS승률(%)"]:.1f}% · 평균 {best_oos["OOS평균(%)"]:.2f}% · '
-            f'PF {best_oos["OOS_PF"]:.2f} · {int(best_oos["OOS신호"])}건'
+        st.warning(
+            "❌ 최종 사전 합격기준을 모두 충족하지 못했습니다. "
+            "이 버전에서는 조건을 수정하지 않습니다."
         )
 
-        st.subheader("⑤ 최고 시장조건 · 기준전략 비교")
-        best_compare=pd.DataFrame([
-            {"구간":"전체 기준",**performance_stats(trades)},
-            {"구간":"전체 시장필터",**performance_stats(filtered_all)},
-            {"구간":"IS 시장필터",**performance_stats(filtered_is)},
-            {"구간":"OOS 시장필터",**performance_stats(filtered_oos)},
-        ])
-        st.dataframe(best_compare,use_container_width=True,hide_index=True)
+    # ========================================================
+    # ② time split
+    # ========================================================
+    st.subheader("② 최종 독립군 내부 60/40")
 
-        st.subheader("⑥ 최고 시장조건 연도별")
-        yr=yearly_stats(filtered_all)
-        st.dataframe(yr,use_container_width=True,hide_index=True)
+    time_df, split_date = v116_time_split_compare(
+        trades,
+        0.60
+    )
 
-        st.subheader("⑦ 최고 시장조건 아웃라이어")
-        stress=stress_outliers(filtered_all)
-        st.dataframe(stress,use_container_width=True,hide_index=True)
+    if split_date is not None:
+        st.write(
+            f"**뒤 40% 시작일:** {split_date}"
+        )
 
-    st.subheader("⑧ 시장배열 단순 비교")
-    arrangement_rows=[]
-    for cat,g in trades.groupby("시장배열"):
-        arrangement_rows.append({"시장배열":cat,**performance_stats(g)})
-    arrangement_df=pd.DataFrame(arrangement_rows)
-    st.dataframe(arrangement_df,use_container_width=True,hide_index=True)
+    st.dataframe(
+        time_df,
+        use_container_width=True,
+        hide_index=True
+    )
 
-    st.subheader("⑨ 전체 연구결과 Excel")
-    setting_df=pd.DataFrame([
-        {"항목":"종목전략","값":"KOSPI F1+F2 고정"},
-        {"항목":"연구대상","값":"KOSPI 지수 시장환경"},
-        {"항목":"조건선택","값":"IS에서만"},
-        {"항목":"목표","값":"승률 우선 + 평균수익/PF 유지"},
-        {"항목":"IS비율","값":f"{train_ratio}%"},
+    # ========================================================
+    # ③ yearly
+    # ========================================================
+    st.subheader("③ 연도별 최종검증")
+
+    year_df = v116_yearly_compare(trades)
+
+    st.dataframe(
+        year_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ========================================================
+    # ④ alignment/regime
+    # ========================================================
+    st.subheader("④ 시장배열별 필터 성과")
+
+    arrangement_rows = []
+
+    for cat, g in filtered.groupby("시장배열"):
+        arrangement_rows.append({
+            "시장배열":cat,
+            **performance_stats(g)
+        })
+
+    arrangement_df = pd.DataFrame(arrangement_rows)
+
+    st.dataframe(
+        arrangement_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ========================================================
+    # ⑤ outlier
+    # ========================================================
+    st.subheader("⑤ 아웃라이어 스트레스")
+
+    stress_df = v116_stress_compare(trades)
+
+    st.dataframe(
+        stress_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ========================================================
+    # ⑥ market filter audit
+    # ========================================================
+    st.subheader("⑥ 시장필터 분포 감사")
+
+    slope = pd.to_numeric(
+        trades["MA60_10일기울기(%)"],
+        errors="coerce"
+    ).dropna()
+
+    fslope = pd.to_numeric(
+        filtered["MA60_10일기울기(%)"],
+        errors="coerce"
+    ).dropna()
+
+    slope_df = pd.DataFrame([
+        {
+            "구분":"전체 F1+F2",
+            "N":len(slope),
+            "평균":round(slope.mean(),3),
+            "중앙":round(slope.median(),3),
+            "Q25":round(slope.quantile(.25),3),
+            "Q50":round(slope.quantile(.50),3),
+            "Q75":round(slope.quantile(.75),3),
+        },
+        {
+            "구분":f"MA60기울기≥{V116_MA60_SLOPE_CUT}%",
+            "N":len(fslope),
+            "평균":round(fslope.mean(),3) if len(fslope) else None,
+            "중앙":round(fslope.median(),3) if len(fslope) else None,
+            "Q25":None,"Q50":None,"Q75":None,
+        }
     ])
 
-    sheets={
-        "00_연구설정":setting_df,
-        "01_기준성과":baseline_df,
-        "02_승패시장환경":wl_df,
-        "03_IS시장조건순위":ranked,
-        "04_OOS비교":oos_compare,
-        "05_시장배열":arrangement_df,
-        "06_전체거래":trades,
-        "07_IS거래":is_df,
-        "08_OOS거래":oos_df,
-    }
+    st.dataframe(
+        slope_df,
+        use_container_width=True,
+        hide_index=True
+    )
 
-    if best_rule_row is not None:
-        sheets["09_최고조건"] = pd.DataFrame([best_rule_row.to_dict()])
-        sheets["10_최고전체거래"] = filtered_all
-        sheets["11_최고IS거래"] = filtered_is
-        sheets["12_최고OOS거래"] = filtered_oos
-        sheets["13_최고연도별"] = yr
-        sheets["14_최고아웃라이어"] = stress
+    # ========================================================
+    # ⑦ trades
+    # ========================================================
+    st.subheader("⑦ v11.6 최종 필터 실제 거래")
 
-    excel_bytes=build_excel(sheets)
+    cols = [
+        "종목명","코드","기준봉일","눌림일","돌파일","진입일",
+        "MA60_10일기울기(%)","지수60일수익률(%)","시장배열",
+        "눌림깊이(%)","돌파종가수익률(%)","전고점20이격(%)",
+        "순수익률(%)","MFE(%)","MAE(%)","청산사유"
+    ]
+
+    st.dataframe(
+        filtered[
+            [c for c in cols if c in filtered.columns]
+        ].sort_values(
+            "진입일",
+            ascending=False
+        ),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ========================================================
+    # ⑧ independence audit
+    # ========================================================
+    st.subheader("⑧ 최종 독립표본 감사")
+
+    audit_df = pd.DataFrame([
+        {
+            "항목":"v11.3 KOSPI 개발군",
+            "종목수":250,
+            "설명":"첫 250종목"
+        },
+        {
+            "항목":"v11.5 시장환경 연구군",
+            "종목수":300,
+            "설명":"다음 300종목"
+        },
+        {
+            "항목":"v11.6 최종 독립군",
+            "종목수":len(universe),
+            "설명":"앞 550종목 제외 후 다음 종목"
+        },
+        {
+            "항목":"기존군과 중복",
+            "종목수":len(overlap),
+            "설명":"반드시 0"
+        }
+    ])
+
+    st.dataframe(
+        audit_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ========================================================
+    # ⑨ Excel
+    # ========================================================
+    st.subheader("⑨ 전체 최종검증 Excel")
+
+    frozen_df = pd.DataFrame([
+        {"항목":"종목전략","값":"KOSPI F1+F2"},
+        {
+            "항목":"시장필터",
+            "값":f"MA60 10일 기울기 >= {V116_MA60_SLOPE_CUT}%"
+        },
+        {"항목":"조건탐색","값":"금지"},
+        {
+            "항목":"최종합격기준",
+            "값":"신호>=30 / 승률>=60% / 평균>=5% / PF>=3 / MDD>-15%"
+        },
+        {
+            "항목":"독립표본",
+            "값":"v11.3/v11.5 사용 KOSPI 앞 550종목 제외"
+        },
+    ])
+
+    excel_bytes = build_excel({
+        "00_고정조건":frozen_df,
+        "01_최종비교":compare_df,
+        "02_시간60_40":time_df,
+        "03_연도별":year_df,
+        "04_시장배열":arrangement_df,
+        "05_아웃라이어":stress_df,
+        "06_시장필터분포":slope_df,
+        "07_기준F1F2거래":trades,
+        "08_v11_6필터거래":filtered,
+        "09_최종독립종목":universe,
+        "10_독립표본감사":audit_df,
+    })
 
     st.download_button(
-        "📦 v11.5 전체 시장환경 연구결과 Excel 다운로드",
+        "📦 v11.6 전체 최종독립검증 Excel 다운로드",
         data=excel_bytes,
-        file_name="swing_v11_5_market_regime_high_winrate_research.xlsx",
+        file_name="swing_v11_6_final_independent_validation.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
 
     if errors:
-        with st.expander(f"조회 실패/데이터 부족 {len(errors)}건"):
+        with st.expander(
+            f"조회 실패/데이터 부족 {len(errors)}건"
+        ):
             st.write(errors)
 
 st.caption(
-    "v11.5는 시장환경 연구판입니다. 종목조건 F1+F2는 변경하지 않습니다. "
-    "여기서 발견된 시장조건도 최종 채택 전에는 다시 미사용 기간/표본에서 검증해야 합니다."
+    "v11.6은 최종 검증판입니다. "
+    "종목조건 F1+F2와 시장필터 MA60 10일 기울기 +0.328%를 완전히 고정합니다. "
+    "결과가 나쁘더라도 이 버전에서는 어떤 조건도 수정하지 않습니다."
 )
