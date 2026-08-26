@@ -4,9 +4,9 @@ import FinanceDataReader as fdr
 import time
 from datetime import date
 
-st.set_page_config(page_title="단기스윙 백테스트 v3", layout="wide")
-st.title("📈 단기스윙 백테스트 v3")
-st.caption("FDR/NAVER 실제 일봉 · 재돌파 확인 다음 거래일 시가 진입 방식")
+st.set_page_config(page_title="단기스윙 백테스트 v4", layout="wide")
+st.title("📈 단기스윙 백테스트 v4")
+st.caption("FDR/NAVER 실제 일봉 · 거래별 진입/손절/청산 검산 강화")
 
 U = {
 "005930":"삼성전자","000660":"SK하이닉스","005380":"현대차","000270":"기아",
@@ -25,47 +25,72 @@ TARGETS = [3, 5, 7, 10]
 def load_data(code, start, end):
     return fdr.DataReader("NAVER:" + code, start, end)
 
-def evaluate_trade(d, entry_i, entry_price, stop_pct, holding_days):
-    stop_price = entry_price * (1 + stop_pct / 100)
-    last_i = min(len(d) - 1, entry_i + holding_days - 1)
-    window = d.iloc[entry_i:last_i + 1]
+def evaluate_trade(d, entry_i, entry_price, stop_loss_pct, holding_days):
+    """일봉 기반 보수적 체결 모델.
+    - 진입은 entry_i 거래일 시가
+    - 손절가는 진입가 대비 stop_loss_pct
+    - 손절일 MAE는 실제 일중 저가가 아니라 '체결 가능한 손절가'까지만 반영
+    - 같은 날 손절가와 목표가를 모두 터치하면 장중 순서를 모르므로 손절 우선
+    """
+    stop_price = entry_price * (1 + stop_loss_pct / 100.0)
+    targets = [3.0, 5.0, 7.0, 10.0]
+    target_hit = {t: False for t in targets}
 
     mfe = 0.0
     mae = 0.0
-    hit = {t: False for t in TARGETS}
-    exit_reason = "기간종료"
-    exit_price = float(window.iloc[-1]["Close"])
-    exit_date = window.index[-1]
-    stopped = False
+    exit_price = None
+    exit_i = None
+    exit_reason = None
 
-    for idx, r in window.iterrows():
-        low_ret = (float(r["Low"]) / entry_price - 1) * 100
-        high_ret = (float(r["High"]) / entry_price - 1) * 100
-        mae = min(mae, low_ret)
-        mfe = max(mfe, high_ret)
+    last_i = min(len(d) - 1, entry_i + holding_days - 1)
 
-        # 일봉 데이터에서는 장중 순서를 알 수 없으므로
-        # 같은 날 손절가와 목표가가 모두 닿으면 보수적으로 손절 우선.
-        if float(r["Low"]) <= stop_price:
-            stopped = True
-            exit_reason = "손절"
+    for i in range(entry_i, last_i + 1):
+        day = d.iloc[i]
+        high = float(day["High"])
+        low = float(day["Low"])
+
+        high_ret = (high / entry_price - 1) * 100.0
+        low_ret = (low / entry_price - 1) * 100.0
+
+        # 손절 터치 여부를 먼저 판정한다.
+        stop_hit = low <= stop_price
+
+        # 손절일에도 손절 체결 전 고가의 순서는 알 수 없으므로
+        # 목표가와 손절가가 같은 날 모두 터치되면 보수적으로 목표 미달 처리.
+        if stop_hit:
+            mfe = max(mfe, max(0.0, high_ret) if high < entry_price * 1.03 else mfe)
+            mae = min(mae, stop_loss_pct)  # 손절 체결 이후 저가를 MAE에 포함하지 않음
             exit_price = stop_price
-            exit_date = idx
+            exit_i = i
+            exit_reason = "손절"
             break
 
-        for t in TARGETS:
-            if not hit[t] and float(r["High"]) >= entry_price * (1 + t / 100):
-                hit[t] = True
+        mfe = max(mfe, high_ret)
+        mae = min(mae, low_ret)
 
-    final_ret = (exit_price / entry_price - 1) * 100
+        for t in targets:
+            if high >= entry_price * (1 + t / 100.0):
+                target_hit[t] = True
+
+    if exit_i is None:
+        exit_i = last_i
+        exit_price = float(d.iloc[last_i]["Close"])
+        exit_reason = "기간종료"
+
+    ret = (exit_price / entry_price - 1) * 100.0
+
     return {
-        "손절": stopped,
-        "+3%": hit[3], "+5%": hit[5], "+7%": hit[7], "+10%": hit[10],
+        "청산일": d.index[exit_i].date(),
+        "청산가": round(exit_price),
+        "청산사유": exit_reason,
+        "수익률(%)": round(ret, 2),
         "MFE(%)": round(mfe, 2),
         "MAE(%)": round(mae, 2),
-        "청산일": exit_date.date(),
-        "청산사유": exit_reason,
-        "최종수익률(%)": round(final_ret, 2),
+        "+3%": target_hit[3.0],
+        "+5%": target_hit[5.0],
+        "+7%": target_hit[7.0],
+        "+10%": target_hit[10.0],
+        "손절가": round(stop_price),
     }
 
 def find_signals(d, code, name, p, cut, end):
@@ -155,7 +180,7 @@ with st.sidebar:
     holding_days = st.number_input("관찰 거래일", 3, 30, 10)
     run = st.button("▶ 백테스트 실행", type="primary", use_container_width=True)
 
-st.info("v3: 눌림 고가 재돌파는 확인 신호로만 사용하고, 실제 진입은 다음 거래일 시가로 계산합니다.")
+st.info("v4: 재돌파 확인 다음 거래일 시가 진입. 손절 발생 시 MAE를 손절가(-3%)까지만 인정하고 거래별 계산 근거를 표시합니다.")
 
 if run:
     end_ts = pd.Timestamp(end_date)
@@ -230,6 +255,7 @@ if run:
         dcol.metric("손익비", "-" if pd.isna(payoff) else f"{payoff:.2f}")
 
         st.subheader("거래별 결과")
+    st.caption("검산 순서: 기준봉일 → 눌림일 → 재돌파확인일 → 진입일/진입가 → 손절가 → 청산일/청산가/사유 → MFE/MAE")
         st.dataframe(
             t.sort_values(["진입일", "종목명"], ascending=[False, True]),
             use_container_width=True,
