@@ -4,8 +4,8 @@ import FinanceDataReader as fdr
 import time
 from datetime import date
 
-st.set_page_config(page_title="단기스윙 백테스트 v4", layout="wide")
-st.title("📈 단기스윙 백테스트 v4")
+st.set_page_config(page_title="단기스윙 백테스트 v4.1", layout="wide")
+st.title("📈 단기스윙 백테스트 v4.1")
 st.caption("FDR/NAVER 실제 일봉 · 거래별 진입/손절/청산 검산 강화")
 
 U = {
@@ -83,7 +83,8 @@ def evaluate_trade(d, entry_i, entry_price, stop_loss_pct, holding_days):
         "청산일": d.index[exit_i].date(),
         "청산가": round(exit_price),
         "청산사유": exit_reason,
-        "수익률(%)": round(ret, 2),
+        "손절": exit_reason == "손절",
+        "최종수익률(%)": round(ret, 2),
         "MFE(%)": round(mfe, 2),
         "MAE(%)": round(mae, 2),
         "+3%": target_hit[3.0],
@@ -255,7 +256,7 @@ if run:
         dcol.metric("손익비", "-" if pd.isna(payoff) else f"{payoff:.2f}")
 
         st.subheader("거래별 결과")
-    st.caption("검산 순서: 기준봉일 → 눌림일 → 재돌파확인일 → 진입일/진입가 → 손절가 → 청산일/청산가/사유 → MFE/MAE")
+        st.caption("검산 순서: 기준봉일 → 눌림일 → 재돌파확인일 → 진입일/진입가 → 손절가 → 청산일/청산가/사유 → MFE/MAE")
         st.dataframe(
             t.sort_values(["진입일", "종목명"], ascending=[False, True]),
             use_container_width=True,
@@ -265,7 +266,7 @@ if run:
         st.download_button(
             "CSV 다운로드",
             t.to_csv(index=False).encode("utf-8-sig"),
-            "swing_backtest_v2.csv",
+            "swing_backtest_v4_1.csv",
             "text/csv",
             use_container_width=True,
         )
