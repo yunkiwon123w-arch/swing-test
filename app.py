@@ -5,9 +5,9 @@ import time
 from datetime import date
 from io import BytesIO
 
-st.set_page_config(page_title="단기스윙 v12 승리확률 스코어링", layout="wide")
-st.title("🎯 단기스윙 v12.0 · 승리확률 스코어링")
-st.caption("단일 컷 최적화 종료 · 여러 진입/시장 지표를 0~100점으로 통합 · 승률 우선 + 수익률/PF 동시 검증")
+st.set_page_config(page_title="단기스윙 v12.1 점수구간 독립검증", layout="wide")
+st.title("🧪 단기스윙 v12.1 · 점수구간 독립검증")
+st.caption("v12.0 점수모델 완전 동결 · 50/55/60/65/70점 기준을 새 미사용 KOSPI 종목군에서 비교")
 
 # ============================================================
 # 완전 동결된 전략값
@@ -1848,15 +1848,163 @@ def stress_scored(df, threshold):
 
     return stress_outliers(q)
 
+
+# ============================================================
+# v12.1 completely frozen model from v12.0 workbook
+# ============================================================
+V121_PRIOR_USED_N = 900   # v11.6까지 750 + v12.0 최종군 150
+V121_THRESHOLDS = [50, 55, 60, 65, 70]
+
+V121_FROZEN_REFS = {'돌파갭(%)': {'weight': 0.9968, 'direction': 1, 'values': [-2.96, -1.87, -1.68, -1.52, -1.4, -1.39, -1.34, -1.21, -1.08, -0.89, -0.71, -0.67, -0.47, -0.44, -0.36, -0.24, -0.06, -0.01, 0.0, 0.0, 0.18, 0.19, 0.22, 0.22, 0.27, 0.41, 0.41, 0.6, 0.68, 0.7, 0.98, 1.09, 1.35, 1.48, 1.57, 1.65, 1.87, 1.91, 1.93, 2.03, 2.05, 2.18, 2.75, 2.8, 2.87, 2.88, 3.2, 4.9, 5.96, 6.24, 6.63, 6.75, 7.6, 7.97, 12.53, 12.9, 14.89, 15.12]}, '전고점20이격(%)': {'weight': 0.4904, 'direction': 1, 'values': [-1.88, -1.87, -1.73, -1.71, -1.34, -1.2, -1.04, -0.71, -0.46, -0.4, -0.19, 0.32, 0.88, 1.13, 1.46, 1.46, 1.57, 1.74, 1.85, 2.03, 2.42, 2.7, 2.74, 2.95, 2.99, 3.15, 3.2, 3.34, 3.69, 3.75, 3.84, 3.93, 4.05, 4.2, 5.12, 5.26, 5.66, 6.32, 6.97, 8.06, 8.57, 9.51, 9.78, 10.65, 11.23, 11.29, 11.49, 12.11, 12.73, 13.42, 13.46, 15.03, 15.07, 17.35, 17.84, 18.1, 18.44, 27.99]}, '눌림깊이(%)': {'weight': 0.473, 'direction': 1, 'values': [-10.41, -10.13, -8.37, -7.02, -6.66, -6.41, -5.4, -4.91, -4.69, -4.6, -4.42, -4.32, -4.08, -4.08, -3.84, -3.72, -3.48, -3.17, -2.61, -1.65, -1.63, -1.47, -1.09, -0.94, -0.93, -0.92, -0.41, -0.3, -0.06, 0.36, 0.47, 0.68, 0.7, 1.04, 1.23, 1.9, 3.09, 3.49, 3.67, 3.86, 4.14, 4.27, 4.64, 5.48, 5.53, 5.94, 6.52, 7.14, 7.16, 7.5, 7.95, 8.78, 9.07, 9.18, 9.44, 14.52, 17.52, 20.74]}, '지수60일수익률(%)': {'weight': 0.4293, 'direction': 1, 'values': [-15.123, -9.7955, -8.4151, -8.2272, -6.4892, -5.8202, -5.4536, -4.5719, -4.4559, -4.3483, -3.9096, -3.6858, -2.2683, -2.2344, -1.9898, -1.8673, -1.7433, -1.6251, -1.4154, -1.2565, -0.7015, -0.4788, -0.3907, -0.0617, 0.2725, 0.6275, 0.746, 1.1906, 1.2889, 1.3225, 1.3289, 1.4578, 2.0323, 2.1942, 2.3087, 2.4638, 2.5642, 2.5655, 2.5925, 3.2763, 3.2763, 3.38, 3.434, 3.7256, 3.9815, 4.3267, 5.356, 5.5204, 5.605, 5.625, 5.9159, 6.1691, 6.1952, 6.1952, 6.523, 8.1233, 8.7653, 11.6366]}, '돌파종가수익률(%)': {'weight': 0.4145, 'direction': 1, 'values': [5.11, 5.15, 5.19, 5.26, 5.5, 5.6, 5.76, 5.82, 5.85, 6.05, 6.34, 6.47, 6.52, 6.65, 6.7, 6.97, 7.07, 7.11, 7.37, 7.57, 7.99, 8.0, 8.06, 8.08, 8.24, 8.41, 8.48, 8.57, 8.87, 9.61, 9.75, 10.08, 10.55, 10.65, 10.67, 11.39, 11.69, 13.07, 13.12, 13.41, 13.51, 14.44, 14.48, 14.82, 15.03, 15.75, 16.53, 16.82, 17.31, 17.35, 17.82, 18.44, 18.97, 20.24, 20.84, 20.9, 28.24, 28.99]}, '전고점60이격(%)': {'weight': 0.4041, 'direction': 1, 'values': [-66.73, -29.58, -15.33, -10.67, -8.5, -2.65, -2.34, -1.88, -1.87, -1.73, -1.71, -1.34, -1.2, -1.04, -0.71, -0.46, -0.4, 0.32, 0.88, 1.13, 1.46, 1.46, 1.74, 1.85, 2.03, 2.7, 2.74, 2.95, 2.99, 3.15, 3.2, 3.69, 3.75, 3.93, 4.05, 4.2, 5.12, 5.66, 6.32, 6.97, 8.06, 8.57, 9.51, 9.78, 10.65, 11.23, 11.29, 12.11, 12.73, 13.42, 13.46, 14.9, 15.03, 15.07, 17.35, 17.84, 18.44, 27.99]}, '돌파거래대금(억)': {'weight': 0.2829, 'direction': 1, 'values': [173.15, 179.45, 182.67, 579.26, 645.69, 757.19, 1038.55, 1268.35, 1357.87, 1558.14, 1584.15, 1669.34, 1701.4, 1746.68, 1823.3, 1849.93, 1913.64, 1954.82, 2013.88, 2020.6, 2034.12, 2048.0, 2215.83, 2256.38, 2278.52, 2296.49, 2298.95, 2300.85, 2406.15, 2521.82, 2681.6, 2799.3, 2913.56, 3071.84, 3118.78, 3159.5, 3324.42, 3751.12, 3772.43, 3837.58, 3966.88, 3995.98, 4525.03, 4618.16, 4809.65, 4856.37, 5102.14, 5340.07, 5362.47, 5530.89, 6049.9, 6754.95, 6810.7, 7580.9, 9095.01, 13828.7, 14724.39, 26590.15]}, 'MA60_10일기울기(%)': {'weight': 0.2751, 'direction': 1, 'values': [-2.47, -1.7663, -1.5039, -1.3124, -1.2514, -1.1855, -1.1834, -1.0908, -1.0434, -0.8451, -0.8208, -0.817, -0.7434, -0.7421, -0.4178, -0.4032, -0.334, -0.3336, -0.3268, -0.1826, -0.0919, -0.0456, -0.0209, 0.0264, 0.0518, 0.0565, 0.1415, 0.1733, 0.2024, 0.3243, 0.3286, 0.332, 0.3344, 0.3344, 0.3506, 0.3511, 0.4813, 0.4851, 0.4888, 0.569, 0.6536, 0.6825, 0.6848, 0.6964, 0.7319, 0.8493, 0.8745, 0.9035, 0.933, 0.933, 0.9691, 0.9718, 1.0091, 1.1918, 1.2261, 1.254, 1.2561, 1.5031]}}
+
+def v121_frozen_model():
+    return {
+        "refs": {
+            f: {
+                "values": np.array(meta["values"], dtype=float),
+                "direction": int(meta["direction"]),
+                "weight": float(meta["weight"]),
+            }
+            for f, meta in V121_FROZEN_REFS.items()
+        },
+        "total_weight": sum(float(meta["weight"]) for meta in V121_FROZEN_REFS.values()),
+        "features": list(V121_FROZEN_REFS.keys()),
+    }
+
+def v121_independent_universe(listing, n):
+    kp = (
+        listing[listing["Market"] == "KOSPI"]
+        .sort_values("Code")
+        .reset_index(drop=True)
+    )
+
+    picked = kp.iloc[
+        V121_PRIOR_USED_N:
+        V121_PRIOR_USED_N + int(n)
+    ].copy().reset_index(drop=True)
+
+    used = set(
+        kp.iloc[:V121_PRIOR_USED_N]["Code"]
+        .astype(str)
+    )
+
+    overlap = (
+        set(picked["Code"].astype(str))
+        & used
+    )
+
+    return picked, overlap, len(kp)
+
+def wilson_interval(wins, n, z=1.96):
+    if n <= 0:
+        return (None, None)
+
+    p = wins / n
+    denom = 1 + z*z/n
+    center = (p + z*z/(2*n)) / denom
+    margin = z * np.sqrt((p*(1-p)/n) + (z*z/(4*n*n))) / denom
+
+    return (
+        max(0.0, center-margin) * 100,
+        min(1.0, center+margin) * 100
+    )
+
+def threshold_comparison_with_ci(df):
+    rows = []
+
+    # baseline
+    s = performance_stats(df)
+    wins = int((df["순수익률(%)"] > 0).sum())
+    lo, hi = wilson_interval(wins, len(df))
+
+    rows.append({
+        "점수기준":"F1+F2 전체",
+        "기준점수":0,
+        **s,
+        "승률95%CI하한":None if lo is None else round(lo,1),
+        "승률95%CI상한":None if hi is None else round(hi,1),
+    })
+
+    for th in V121_THRESHOLDS:
+        q = df[
+            pd.to_numeric(
+                df["승리점수"],
+                errors="coerce"
+            ) >= th
+        ].copy()
+
+        if q.empty:
+            continue
+
+        s = performance_stats(q)
+        wins = int((q["순수익률(%)"] > 0).sum())
+        lo, hi = wilson_interval(wins, len(q))
+
+        rows.append({
+            "점수기준":f"{th}점 이상",
+            "기준점수":th,
+            **s,
+            "승률95%CI하한":round(lo,1),
+            "승률95%CI상한":round(hi,1),
+        })
+
+    return pd.DataFrame(rows)
+
+def low_vs_high_score(df, cut=50):
+    low = df[
+        pd.to_numeric(df["승리점수"], errors="coerce") < cut
+    ].copy()
+    high = df[
+        pd.to_numeric(df["승리점수"], errors="coerce") >= cut
+    ].copy()
+
+    rows = []
+
+    for label, q in [
+        (f"{cut}점 미만", low),
+        (f"{cut}점 이상", high),
+    ]:
+        s = performance_stats(q)
+        wins = int((q["순수익률(%)"] > 0).sum()) if len(q) else 0
+        lo, hi = wilson_interval(wins, len(q))
+
+        rows.append({
+            "그룹":label,
+            **s,
+            "승률95%CI하한":None if lo is None else round(lo,1),
+            "승률95%CI상한":None if hi is None else round(hi,1),
+        })
+
+    return pd.DataFrame(rows)
+
+def threshold_yearly(df):
+    q = df.copy()
+    q["연도"] = pd.to_datetime(q["진입일"]).dt.year
+    rows = []
+
+    for th in V121_THRESHOLDS:
+        z = q[
+            pd.to_numeric(q["승리점수"], errors="coerce") >= th
+        ].copy()
+
+        for y, g in z.groupby("연도"):
+            rows.append({
+                "기준점수":th,
+                "연도":int(y),
+                **performance_stats(g)
+            })
+
+    return pd.DataFrame(rows)
+
 # ============================================================
 # UI
 # ============================================================
 with st.sidebar:
-    st.header("v12.0 스코어링 연구")
+    st.header("v12.1 독립검증 설정")
 
     end_date = st.date_input(
         "종료일",
-        date(2026, 7, 31),
+        date(2026,7,31),
         disabled=True
     )
 
@@ -1868,33 +2016,22 @@ with st.sidebar:
         disabled=True
     )
 
-    top_features = st.selectbox(
-        "점수에 사용할 상위 변수 수",
-        [5, 6, 8, 10],
+    universe_n = st.selectbox(
+        "새 미사용 KOSPI 종목 수",
+        [50, 75, 100, 150],
         index=2
     )
 
-    dev_train_ratio = st.slider(
-        "개발표본 IS 비율(%)",
-        50, 75, 60, 5
-    )
-
-    final_n = st.selectbox(
-        "최종 미사용 KOSPI 종목 수",
-        [100, 150, 200],
-        index=1
-    )
-
     run = st.button(
-        "▶ v12.0 스코어링 검증 실행",
+        "▶ v12.1 점수구간 독립검증",
         type="primary",
         use_container_width=True
     )
 
 st.info(
-    "v12는 단일 지표 컷을 추가하지 않습니다. "
-    "기존 KOSPI F1+F2 거래의 여러 진입/시장 특성을 종합해 0~100점 승리점수를 만들고, "
-    "개발 OOS에서 점수 기준을 고른 뒤 완전히 새로운 KOSPI 종목군에 그대로 적용합니다."
+    "v12.1에서는 점수모델을 다시 학습하지 않습니다. "
+    "v12.0에서 확정된 8개 변수, 방향, 가중치, 개발 IS 기준분포까지 코드에 고정했습니다. "
+    "앞서 사용한 KOSPI 900종목을 제외한 이후 미사용 종목에서 50/55/60/65/70점 기준을 그대로 비교합니다."
 )
 
 if run:
@@ -1910,21 +2047,33 @@ if run:
         st.exception(e)
         st.stop()
 
-    dev_universe = v12_dev_universe(listing)
-    final_universe, overlap = v12_final_universe(listing, int(final_n))
+    universe, overlap, total_kospi = v121_independent_universe(
+        listing,
+        int(universe_n)
+    )
 
     if overlap:
-        st.error(f"최종 독립표본 오류: 기존 사용군과 {len(overlap)}종목 중복")
+        st.error(
+            f"독립표본 오류: 기존 사용군과 {len(overlap)}종목 중복"
+        )
         st.stop()
 
-    if final_universe.empty:
-        st.error("최종 미사용 KOSPI 종목이 부족합니다.")
+    if universe.empty:
+        st.error(
+            f"KOSPI 전체 {total_kospi}종목 중 앞 {V121_PRIOR_USED_N}종목을 제외하면 "
+            "검증 가능한 미사용 종목이 없습니다."
+        )
         st.stop()
+
+    st.write(
+        f"**실제 새 독립표본:** {len(universe)}종목 "
+        f"(KOSPI 전체 {total_kospi}종목 중 앞 {V121_PRIOR_USED_N}개 제외)"
+    )
 
     try:
         ks11 = load_benchmark(
             "KS11",
-            (start_ts - pd.Timedelta(days=220)).strftime("%Y-%m-%d"),
+            (start_ts-pd.Timedelta(days=220)).strftime("%Y-%m-%d"),
             fetch_end.strftime("%Y-%m-%d")
         )
     except Exception as e:
@@ -1937,190 +2086,149 @@ if run:
 
     progress = st.progress(0)
     status = st.empty()
+    setups = []
+    data_map = {}
     errors = []
+    total = len(universe)
 
-    def collect_trades(universe, label, progress_start, progress_end):
-        setups = []
-        data_map = {}
-        total = len(universe)
+    for pos, (_, r) in enumerate(universe.iterrows(), 1):
+        code0 = str(r["Code"]).zfill(6)
+        name = r["Name"]
 
-        for pos, (_, r) in enumerate(universe.iterrows(), 1):
-            code0 = str(r["Code"]).zfill(6)
-            name = r["Name"]
+        status.info(
+            f"1/2 새 독립군 데이터/신호 {pos}/{total} · {name}"
+        )
 
-            status.info(
-                f"{label} 데이터/신호 {pos}/{total} · {name}"
+        try:
+            d = load_data(
+                code0,
+                start_ts.strftime("%Y-%m-%d"),
+                fetch_end.strftime("%Y-%m-%d")
             )
 
-            try:
-                d = load_data(
-                    code0,
-                    start_ts.strftime("%Y-%m-%d"),
-                    fetch_end.strftime("%Y-%m-%d")
-                )
-
-                if d is None or d.empty or len(d) < 140:
-                    continue
-
-                found, prepared = find_setups(
-                    d,
-                    code0,
-                    name,
-                    "KOSPI",
-                    cut,
-                    end_ts
-                )
-
-                data_map[code0] = prepared
-
-                if found:
-                    setups.extend(found)
-
-            except Exception as e:
-                errors.append(
-                    f"{label} {name}({code0}): {type(e).__name__}"
-                )
-
-            frac = progress_start + (progress_end - progress_start) * (pos / max(total, 1))
-            progress.progress(min(frac, 1.0))
-            time.sleep(0.005)
-
-        if not setups:
-            return pd.DataFrame()
-
-        setup_df = dedup_setups(pd.DataFrame(setups))
-        selected = setup_df[
-            setup_df.apply(frozen_filter, axis=1)
-        ].reset_index(drop=True)
-
-        rows = []
-
-        for _, setup in selected.iterrows():
-            code0 = str(setup["코드"]).zfill(6)
-            d = data_map.get(code0)
-            if d is None:
+            if d is None or d.empty or len(d) < 140:
                 continue
 
-            entry = make_entry(d, setup)
-            ev = evaluate_trade(d, setup, entry)
+            found, prepared = find_setups(
+                d,
+                code0,
+                name,
+                "KOSPI",
+                cut,
+                end_ts
+            )
 
-            row = setup.drop(
-                labels=["_b","_pull_i","_breakout_i"],
-                errors="ignore"
-            ).to_dict()
+            data_map[code0] = prepared
 
-            row.update({
-                k:v for k,v in entry.items()
-                if not k.startswith("_")
-            })
+            if found:
+                setups.extend(found)
 
-            row.update(ev)
-            row.update(setup_features(d, setup))
-            rows.append(row)
+        except Exception as e:
+            errors.append(
+                f"{name}({code0}): {type(e).__name__}"
+            )
 
-        out = pd.DataFrame(rows)
+        progress.progress(pos/(total*2))
+        time.sleep(0.005)
 
-        if not out.empty:
-            out = attach_kospi_market_features(out, ks11)
-
-        return out
-
-    dev_trades = collect_trades(
-        dev_universe,
-        "1/2 개발군",
-        0.0,
-        0.50
-    )
-
-    if dev_trades.empty:
+    if not setups:
         progress.empty()
-        status.warning("개발군 F1+F2 거래가 없습니다.")
+        status.warning("새 독립군에서 setup이 없습니다.")
         st.stop()
 
-    final_trades = collect_trades(
-        final_universe,
-        "2/2 최종 독립군",
-        0.50,
-        1.0
-    )
+    setup_df = dedup_setups(pd.DataFrame(setups))
+
+    selected = setup_df[
+        setup_df.apply(
+            frozen_filter,
+            axis=1
+        )
+    ].reset_index(drop=True)
+
+    rows = []
+
+    for idx, (_, setup) in enumerate(selected.iterrows(), 1):
+        code0 = str(setup["코드"]).zfill(6)
+        d = data_map.get(code0)
+
+        if d is None:
+            continue
+
+        entry = make_entry(d, setup)
+        ev = evaluate_trade(d, setup, entry)
+
+        row = setup.drop(
+            labels=["_b","_pull_i","_breakout_i"],
+            errors="ignore"
+        ).to_dict()
+
+        row.update({
+            k:v for k,v in entry.items()
+            if not k.startswith("_")
+        })
+
+        row.update(ev)
+        row.update(setup_features(d, setup))
+        rows.append(row)
+
+        if len(selected):
+            progress.progress(
+                0.5 + idx/(len(selected)*2)
+            )
 
     progress.empty()
 
-    if final_trades.empty:
-        status.warning("최종 독립군 F1+F2 거래가 없습니다.")
+    trades = pd.DataFrame(rows)
+
+    if trades.empty:
+        status.warning("새 독립군에서 F1+F2 거래가 없습니다.")
         st.stop()
+
+    trades = attach_kospi_market_features(
+        trades,
+        ks11
+    )
+
+    model = v121_frozen_model()
+    scored = apply_score_model(
+        trades,
+        model
+    )
 
     status.success(
-        f"완료 · 개발군 {len(dev_universe)}종목/{len(dev_trades)}거래 · "
-        f"최종 미사용군 {len(final_universe)}종목/{len(final_trades)}거래"
+        f"완료 · 새 미사용 KOSPI {len(universe)}종목 · "
+        f"F1+F2 거래 {len(scored)}건"
     )
 
     # ========================================================
-    # Development split
+    # ① Frozen model audit
     # ========================================================
-    dev_is, dev_oos, split_date = fixed_time_split(
-        dev_trades,
-        dev_train_ratio / 100.0
-    )
+    st.subheader("① v12.0 점수모델 동결 확인")
 
-    if dev_oos.empty:
-        st.warning("개발 OOS 표본이 부족합니다.")
-        st.stop()
+    model_rows = []
+    for f, meta in V121_FROZEN_REFS.items():
+        model_rows.append({
+            "변수":f,
+            "가중치":meta["weight"],
+            "방향":"높을수록 유리" if meta["direction"] > 0 else "낮을수록 유리",
+            "고정기준값수":len(meta["values"]),
+        })
 
-    st.subheader("① 기준 F1+F2 성과")
-    baseline_df = pd.DataFrame([
-        {"구간":"개발 전체", **performance_stats(dev_trades)},
-        {"구간":"개발 IS", **performance_stats(dev_is)},
-        {"구간":"개발 OOS", **performance_stats(dev_oos)},
-        {"구간":"최종 미사용군 기준", **performance_stats(final_trades)},
-    ])
-    st.dataframe(
-        baseline_df,
-        use_container_width=True,
-        hide_index=True
-    )
-    st.write(f"**개발 OOS 시작일:** {split_date}")
-
-    # ========================================================
-    # Build score only from DEV IS
-    # ========================================================
-    st.subheader("② 개발 IS에서 승리점수 모델 생성")
-
-    model, selected_features = build_score_model(
-        dev_is,
-        top_n=int(top_features)
-    )
-
-    if model is None or not model["features"]:
-        st.error("점수 모델을 만들 수 없습니다.")
-        st.stop()
-
-    st.caption(
-        "각 변수는 개발 IS 안에서 승리군과 손실군의 표준화 차이로 방향/가중치를 정하고, "
-        "IS 분포상의 백분위 점수로 변환해 가중평균합니다."
-    )
+    model_audit = pd.DataFrame(model_rows)
 
     st.dataframe(
-        selected_features[
-            ["변수","승리평균","손실평균","표준화차이","방향","절대차이"]
-        ],
+        model_audit,
         use_container_width=True,
         hide_index=True
     )
 
-    dev_is_scored = apply_score_model(dev_is, model)
-    dev_oos_scored = apply_score_model(dev_oos, model)
-    dev_all_scored = apply_score_model(dev_trades, model)
-    final_scored = apply_score_model(final_trades, model)
-
     # ========================================================
-    # Threshold selected on DEV OOS
+    # ② Thresholds
     # ========================================================
-    st.subheader("③ 개발 OOS 점수별 성과")
+    st.subheader("② 새 독립표본 · 점수 기준 비교")
 
-    threshold, threshold_df = choose_score_threshold(
-        dev_oos_scored,
-        min_signals=max(8, int(len(dev_oos_scored) * 0.20))
+    threshold_df = threshold_comparison_with_ci(
+        scored
     )
 
     st.dataframe(
@@ -2129,140 +2237,158 @@ if run:
         hide_index=True
     )
 
-    st.subheader("④ 개발 OOS 점수구간")
+    # ========================================================
+    # ③ 50 below/above
+    # ========================================================
+    st.subheader("③ 50점 미만 vs 50점 이상")
 
-    dev_band = score_band_table(dev_oos_scored)
+    binary_df = low_vs_high_score(
+        scored,
+        50
+    )
 
     st.dataframe(
-        dev_band,
+        binary_df,
         use_container_width=True,
         hide_index=True
     )
 
-    if threshold is None:
-        st.warning(
-            "개발 OOS에서 최소 표본/수익/PF 기준을 만족하는 점수 컷이 없습니다. "
-            "점수 전략을 억지로 채택하지 않습니다."
-        )
-        st.stop()
+    # ========================================================
+    # ④ bands
+    # ========================================================
+    st.subheader("④ 점수구간별 성과")
 
-    st.success(
-        f"개발 OOS에서 선택된 고정 점수 기준: **{threshold:.0f}점 이상**"
+    band_df = score_band_table(
+        scored
+    )
+
+    st.dataframe(
+        band_df,
+        use_container_width=True,
+        hide_index=True
     )
 
     # ========================================================
-    # Final untouched validation
+    # ⑤ interpretation
     # ========================================================
-    st.subheader("⑤ 최종 미사용 종목군 검증")
+    st.subheader("⑤ 승률 우선 판정")
 
-    final_selected = final_scored[
-        pd.to_numeric(
-            final_scored["승리점수"],
-            errors="coerce"
-        ) >= threshold
+    rows = []
+    for th in V121_THRESHOLDS:
+        q = scored[
+            pd.to_numeric(
+                scored["승리점수"],
+                errors="coerce"
+            ) >= th
+        ].copy()
+
+        if q.empty:
+            continue
+
+        s = performance_stats(q)
+
+        rows.append({
+            "기준":th,
+            "신호":s["신호"],
+            "승률(%)":s["승률(%)"],
+            "평균수익률(%)":s["평균수익률(%)"],
+            "PF":s["ProfitFactor"],
+            "MDD(%)":s["MDD(%)"],
+            "승률60이상":s["승률(%)"] >= 60,
+            "평균5이상":s["평균수익률(%)"] >= 5,
+            "PF3이상":(
+                s["ProfitFactor"] is not None
+                and s["ProfitFactor"] >= 3
+            ),
+        })
+
+    decision_df = pd.DataFrame(rows)
+
+    st.dataframe(
+        decision_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # Do not auto-pick a new threshold from this final sample.
+    qualifying = decision_df[
+        (decision_df["신호"] >= 15)
+        & decision_df["승률60이상"]
+        & decision_df["평균5이상"]
+        & decision_df["PF3이상"]
     ].copy()
 
-    final_compare = pd.DataFrame([
-        {
-            "전략":"최종군 F1+F2 기준",
-            **performance_stats(final_scored)
-        },
-        {
-            "전략":f"v12 점수 {threshold:.0f}점 이상",
-            **performance_stats(final_selected)
-        }
-    ])
-
-    st.dataframe(
-        final_compare,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    fs = performance_stats(final_selected)
-
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("최종 신호", fs["신호"])
-    c2.metric("최종 승률", f'{fs["승률(%)"]:.1f}%')
-    c3.metric("최종 평균수익률", f'{fs["평균수익률(%)"]:.2f}%')
-    c4.metric(
-        "최종 PF",
-        "-" if fs["ProfitFactor"] is None
-        else f'{fs["ProfitFactor"]:.2f}'
-    )
-
-    # 승률 우선 최종 기준
-    passed = (
-        fs["신호"] >= 20
-        and fs["승률(%)"] >= 65.0
-        and fs["평균수익률(%)"] >= 5.0
-        and fs["ProfitFactor"] is not None
-        and fs["ProfitFactor"] >= 3.0
-        and fs["MDD(%)"] > -20.0
-    )
-
-    if passed:
+    if len(qualifying) >= 2:
         st.success(
-            "✅ v12 최종 독립검증 통과: "
-            "신호≥20 / 승률≥65% / 평균수익률≥5% / PF≥3 / MDD>-20%"
+            "점수모델 재현 신호 있음: 여러 인접 점수기준에서 동시에 "
+            "승률≥60% / 평균≥5% / PF≥3이 유지됩니다. "
+            "특정 한 컷만 우연히 좋은 형태보다 강한 결과입니다."
+        )
+    elif len(qualifying) == 1:
+        st.warning(
+            "한 개 점수기준만 목표를 통과했습니다. "
+            "특정 컷 과적합 가능성을 배제하기 어렵습니다."
         )
     else:
         st.warning(
-            "❌ v12 최종 합격기준을 모두 만족하지 못했습니다. "
-            "이 결과를 보고 점수 기준을 다시 맞추지 않습니다."
+            "새 독립표본에서 승률/수익률 동시 목표가 재현되지 않았습니다. "
+            "이 결과를 보고 점수 가중치나 컷을 다시 조정하지 않습니다."
         )
 
     # ========================================================
-    # Final score bands / robustness
+    # ⑥ yearly
     # ========================================================
-    st.subheader("⑥ 최종군 점수구간별 성과")
+    st.subheader("⑥ 점수기준 × 연도")
 
-    final_band = score_band_table(final_scored)
+    yearly_df = threshold_yearly(
+        scored
+    )
 
     st.dataframe(
-        final_band,
+        yearly_df,
         use_container_width=True,
         hide_index=True
     )
 
-    st.subheader("⑦ 최종 점수전략 연도별")
+    # ========================================================
+    # ⑦ outlier
+    # ========================================================
+    st.subheader("⑦ 50점 이상 아웃라이어 스트레스")
 
-    final_year = yearly_scored(
-        final_scored,
-        threshold
+    high50 = scored[
+        pd.to_numeric(
+            scored["승리점수"],
+            errors="coerce"
+        ) >= 50
+    ].copy()
+
+    stress_df = stress_outliers(
+        high50
     )
 
     st.dataframe(
-        final_year,
+        stress_df,
         use_container_width=True,
         hide_index=True
     )
 
-    st.subheader("⑧ 최종 점수전략 아웃라이어")
-
-    final_stress = stress_scored(
-        final_scored,
-        threshold
-    )
-
-    st.dataframe(
-        final_stress,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.subheader("⑨ 최종 점수전략 실제 거래")
+    # ========================================================
+    # ⑧ actual trades
+    # ========================================================
+    st.subheader("⑧ 새 독립군 전체 거래")
 
     cols = [
         "종목명","코드","진입일","승리점수",
-        "돌파종가수익률(%)","전고점20이격(%)","눌림깊이(%)",
-        "MA60_10일기울기(%)","지수20일수익률(%)",
+        "돌파갭(%)","전고점20이격(%)","눌림깊이(%)",
+        "지수60일수익률(%)","돌파종가수익률(%)",
+        "전고점60이격(%)","돌파거래대금(억)",
+        "MA60_10일기울기(%)",
         "순수익률(%)","MFE(%)","MAE(%)","청산사유"
     ]
 
     st.dataframe(
-        final_selected[
-            [c for c in cols if c in final_selected.columns]
+        scored[
+            [c for c in cols if c in scored.columns]
         ].sort_values(
             ["승리점수","진입일"],
             ascending=[False,False]
@@ -2272,30 +2398,30 @@ if run:
     )
 
     # ========================================================
-    # Independence audit
+    # ⑨ independence
     # ========================================================
-    st.subheader("⑩ 표본 독립성 감사")
+    st.subheader("⑨ 독립표본 감사")
 
     audit_df = pd.DataFrame([
         {
-            "항목":"v12 점수모델 개발군",
-            "종목수":len(dev_universe),
-            "범위":"KOSPI Code 정렬 앞 550개"
+            "항목":"v12.0 이전 사용범위",
+            "종목수":750,
+            "설명":"v11.6까지"
         },
         {
-            "항목":"v11.6까지 기존 사용범위",
-            "종목수":V12_PRIOR_USED_N,
-            "범위":"KOSPI Code 정렬 앞 750개"
+            "항목":"v12.0 최종 검증군",
+            "종목수":150,
+            "설명":"750 이후 150개"
         },
         {
-            "항목":"v12 최종 미사용군",
-            "종목수":len(final_universe),
-            "범위":"앞 750개 제외 이후"
+            "항목":"v12.1 새 독립군",
+            "종목수":len(universe),
+            "설명":"앞 900개 모두 제외 후 이후 종목"
         },
         {
             "항목":"중복",
             "종목수":len(overlap),
-            "범위":"반드시 0"
+            "설명":"반드시 0"
         },
     ])
 
@@ -2308,43 +2434,34 @@ if run:
     # ========================================================
     # Excel
     # ========================================================
-    st.subheader("⑪ 전체 v12 연구결과 Excel")
-
-    model_df = selected_features.copy()
-    model_df["선택점수기준"] = threshold
+    st.subheader("⑩ 전체 v12.1 결과 Excel")
 
     settings_df = pd.DataFrame([
-        {"항목":"기준전략","값":"KOSPI F1+F2"},
-        {"항목":"모델","값":"IS 승/패 표준화차이 + IS 백분위 가중점수"},
-        {"항목":"변수수","값":int(top_features)},
-        {"항목":"점수기준 선택","값":"개발 OOS에서 승률 최우선"},
-        {"항목":"최종 검증","값":"앞 750 KOSPI 제외한 미사용 종목군"},
-        {"항목":"선택점수","값":threshold},
+        {"항목":"점수모델","값":"v12.0 완전 동결"},
+        {"항목":"변수수","값":8},
+        {"항목":"비교점수","값":"50/55/60/65/70"},
+        {"항목":"중요원칙","값":"v12.1 새 표본 결과로 모델/가중치/컷 재학습 금지"},
+        {"항목":"독립범위","값":"KOSPI 앞 900종목 제외"},
     ])
 
     excel_bytes = build_excel({
         "00_설정":settings_df,
-        "01_기준성과":baseline_df,
-        "02_점수모델":model_df,
-        "03_개발OOS점수기준":threshold_df,
-        "04_개발OOS점수구간":dev_band,
-        "05_최종비교":final_compare,
-        "06_최종점수구간":final_band,
-        "07_최종연도별":final_year,
-        "08_최종아웃라이어":final_stress,
-        "09_최종전체거래":final_scored,
-        "10_최종선택거래":final_selected,
-        "11_개발전체거래":dev_all_scored,
-        "12_개발IS거래":dev_is_scored,
-        "13_개발OOS거래":dev_oos_scored,
-        "14_표본감사":audit_df,
-        "15_최종종목군":final_universe,
+        "01_모델감사":model_audit,
+        "02_점수기준비교":threshold_df,
+        "03_50점상하":binary_df,
+        "04_점수구간":band_df,
+        "05_판정표":decision_df,
+        "06_연도별":yearly_df,
+        "07_50점이상아웃라이어":stress_df,
+        "08_전체거래":scored,
+        "09_독립종목":universe,
+        "10_표본감사":audit_df,
     })
 
     st.download_button(
-        "📦 v12.0 전체 스코어링 연구결과 Excel 다운로드",
+        "📦 v12.1 전체 점수구간 독립검증 Excel 다운로드",
         data=excel_bytes,
-        file_name="swing_v12_0_win_probability_scoring.xlsx",
+        file_name="swing_v12_1_score_threshold_independent_validation.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
@@ -2356,7 +2473,7 @@ if run:
             st.write(errors)
 
 st.caption(
-    "v12.0은 승률 우선 스코어링 연구판입니다. "
-    "점수 방향/가중치는 개발 IS에서만 만들고, 점수 기준은 개발 OOS에서 고른 뒤 "
-    "앞 750개 KOSPI 종목을 제외한 최종 미사용 종목군에 한 번만 적용합니다."
+    "v12.1은 v12.0 점수모델의 재현성 검증판입니다. "
+    "8개 변수, 방향, 가중치, 개발 IS 기준분포를 모두 고정했고, "
+    "새 독립표본에서는 점수 기준의 성과만 비교합니다."
 )
