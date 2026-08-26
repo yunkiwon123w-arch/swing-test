@@ -4,9 +4,9 @@ import FinanceDataReader as fdr
 import time
 from datetime import date
 
-st.set_page_config(page_title="단기스윙 백테스트 v9", layout="wide")
-st.title("🧪 단기스윙 v9 · 진입/청산 구조 비교")
-st.caption("대규모 표본 · 돌파 거래량 필터 유지 · 진입 3종 × 청산 3종 = 9개 조합")
+st.set_page_config(page_title="단기스윙 백테스트 v10", layout="wide")
+st.title("🧪 단기스윙 v10 · E1+X3 엣지 검증")
+st.caption("v9 1위 E1 돌파당일 + X3 트레일 고정 · 표본확대 · 아웃라이어/연도/종목/트레일 민감도 검증")
 
 TARGETS = [3.0, 5.0, 7.0, 10.0]
 
@@ -229,7 +229,7 @@ def evaluate_trade(d, setup, entry, exit_mode, p):
         if low <= active_stop:
             mae = min(mae, (active_stop / entry_price - 1) * 100)
             # 같은 날 상승과 손절 순서는 알 수 없으므로 손절 우선.
-            if high < entry_price * 1.03:
+            if high < entry_price * (1 + p.get("activation_pct", 3.0) / 100.0):
                 mfe = max(mfe, max(0.0, high_ret))
             exit_i = i
             exit_price = active_stop
@@ -247,7 +247,7 @@ def evaluate_trade(d, setup, entry, exit_mode, p):
                 hit[t] = True
 
         # +3% 활성화는 그 거래일 종료 후부터 적용.
-        if exit_mode == "X3 +3%후트레일" and high >= entry_price * 1.03:
+        if exit_mode == "X3 +3%후트레일" and high >= entry_price * (1 + p.get("activation_pct", 3.0) / 100.0):
             activated = True
 
         highest_before_today = max(highest_before_today, high)
@@ -310,255 +310,149 @@ def choose_universe(listing, n):
     # 코드순 표본. 향후 v10에서 거래대금/시총 기반 표본으로 개선 가능.
     return listing.sort_values(["Market", "Code"]).head(n).copy()
 
-ENTRY_MODES = ["E1 돌파당일", "E2 종가확인", "E3 재눌림"]
-EXIT_MODES = ["X1 고정-3%", "X2 눌림저점", "X3 +3%후트레일"]
+ENTRY_MODE = "E1 돌파당일"
+EXIT_MODE = "X3 +3%후트레일"
 
 with st.sidebar:
-    st.header("대규모 검증 설정")
+    st.header("v10 검증 설정")
     end_date = st.date_input("종료일", date(2026, 7, 31))
-    years = st.selectbox("검증 기간", [1, 2, 3], index=1, format_func=lambda x: f"{x}년")
-    universe_n = st.selectbox("검증 종목 수", [50, 100, 200, 300], index=2)
+    years = st.selectbox("검증 기간", [2, 3, 4, 5], index=3, format_func=lambda x: f"{x}년")
+    universe_n = st.selectbox("검증 종목 수", [200, 300, 500, 700], index=2)
 
     st.divider()
-    st.subheader("기준 신호")
+    st.subheader("기준 신호 · v9 유지")
     base_rise = st.number_input("기준봉 상승률(%)", value=10.0, step=0.5)
     value_eok = st.number_input("기준봉 최소 거래대금(억)", value=1000, step=100)
     volume_mult = st.number_input("20일 거래량 배수", value=2.0, step=0.5)
     pullback_ratio = st.slider("눌림 거래량 비율(%)", 10, 100, 50, 5)
-    breakout_vol_cut = st.number_input(
-        "돌파 거래량 / 눌림 거래량(배)",
-        value=1.8, step=0.1
-    )
+    breakout_vol_cut = st.number_input("돌파 거래량 / 눌림 거래량(배)", value=1.8, step=0.1)
+    holding_days = st.number_input("최대 보유 거래일", 3, 15, 5)
 
     st.divider()
-    st.subheader("재눌림/청산")
-    retest_days = st.number_input("재눌림 대기 거래일", 1, 5, 3)
-    retest_touch_pct = st.number_input("돌파선 위 재눌림 허용폭(%)", value=2.0, step=0.5)
-    holding_days = st.number_input("최대 보유 거래일", 3, 15, 5)
-    max_structural_risk = st.number_input("눌림저점 손절 최대 위험폭(%)", value=7.0, step=0.5)
-    trail_pct = st.number_input("+3% 이후 트레일 폭(%)", value=3.0, step=0.5)
+    st.subheader("X3 민감도")
+    activation_list = st.multiselect("트레일 활성화 수익률(%)", [2.0, 3.0, 4.0, 5.0], default=[2.0,3.0,4.0,5.0])
+    trail_list = st.multiselect("트레일 폭(%)", [2.0, 3.0, 4.0], default=[2.0,3.0,4.0])
+    run = st.button("▶ v10 강건성 검증", type="primary", use_container_width=True)
 
-    run = st.button("▶ 9조합 대규모 검증", type="primary", use_container_width=True)
-
-st.info(
-    "기본값: 200종목·2년·돌파거래량 1.8배. "
-    "E1=돌파당일 / E2=돌파종가 확인 다음날 / E3=돌파 후 재눌림. "
-    "X1=-3% 고정 / X2=눌림저점 손절 / X3=+3% 확인 후 본전·트레일."
-)
+st.info("핵심 검증: 500종목·5년 / E1 돌파당일 고정 / X3 활성화 2·3·4·5% × 트레일 2·3·4% / 최고수익 거래 제거 / 연도별·종목별 분해")
 
 if run:
+    if not activation_list or not trail_list:
+        st.warning("활성화 수익률과 트레일 폭을 1개 이상 선택하세요.")
+        st.stop()
+
     end_ts = pd.Timestamp(end_date)
     cut = end_ts - pd.DateOffset(years=years)
     start_ts = cut - pd.Timedelta(days=90)
     fetch_end = end_ts + pd.Timedelta(days=45)
-
-    p = {
-        "base_rise": base_rise,
-        "value_eok": value_eok,
-        "volume_mult": volume_mult,
-        "pullback_ratio": pullback_ratio / 100,
-        "breakout_vol_cut": breakout_vol_cut,
-        "retest_days": int(retest_days),
-        "retest_touch_pct": retest_touch_pct,
-        "holding_days": int(holding_days),
-        "max_structural_risk": max_structural_risk,
-        "trail_pct": trail_pct,
+    base_p = {
+        "base_rise": base_rise, "value_eok": value_eok, "volume_mult": volume_mult,
+        "pullback_ratio": pullback_ratio / 100, "breakout_vol_cut": breakout_vol_cut,
+        "retest_days": 3, "retest_touch_pct": 2.0, "holding_days": int(holding_days),
+        "max_structural_risk": 7.0, "trail_pct": 3.0, "activation_pct": 3.0,
     }
 
     try:
         listing = stock_listing()
     except Exception as e:
         st.error(f"종목 목록 조회 실패: {type(e).__name__}")
-        st.exception(e)
         st.stop()
-
     universe = choose_universe(listing, int(universe_n))
     total = len(universe)
-
-    status = st.empty()
     bar = st.progress(0)
-    raw_rows, data_map, errors = [], {}, []
+    status = st.empty()
+    setups, data_map, errors = [], {}, []
 
     for pos, (_, r) in enumerate(universe.iterrows(), 1):
-        code = str(r["Code"]).zfill(6)
-        name = r["Name"]
-        market = r["Market"]
-
-        status.info(f"1/2 신호수집 {pos}/{total} · {market} {name}")
-        bar.progress(pos / (total * 2))
-
+        code, name, market = str(r["Code"]).zfill(6), r["Name"], r["Market"]
+        status.write(f"데이터/신호 탐색 {pos}/{total} · {name}")
         try:
-            d = load_data(
-                code,
-                start_ts.strftime("%Y-%m-%d"),
-                fetch_end.strftime("%Y-%m-%d")
-            )
-
-            if d is None or d.empty or len(d) < 30:
-                errors.append(f"{name}: 데이터 부족")
+            d = load_data(code, start_ts.date(), fetch_end.date())
+            if d is None or len(d) < 80:
                 continue
-
-            rows, prepared = find_setups(d, code, name, market, p, cut, end_ts)
-            raw_rows.extend(rows)
-            data_map[code] = prepared
-
+            d = add_indicators(d)
+            data_map[code] = d
+            found = find_setups(d, code, name, market, cut, end_ts, base_p)
+            if found is not None and len(found):
+                setups.extend(found.to_dict("records"))
         except Exception as e:
-            errors.append(f"{name}: {type(e).__name__}")
+            errors.append(f"{name}({code}): {type(e).__name__}")
+        bar.progress(pos / total)
+        time.sleep(0.01)
 
-        time.sleep(0.02)
+    if not setups:
+        bar.empty(); st.warning("조건을 만족한 setup이 없습니다."); st.stop()
+    setup_df = pd.DataFrame(setups)
 
-    raw = pd.DataFrame(raw_rows)
-    setups = dedup_setups(raw)
+    grid_rows, all_results = [], []
+    combos = [(a,t) for a in activation_list for t in trail_list]
+    for ci, (activation, trail) in enumerate(combos, 1):
+        status.write(f"X3 민감도 계산 {ci}/{len(combos)} · 활성 +{activation:g}% / 트레일 {trail:g}%")
+        p = dict(base_p); p["activation_pct"] = float(activation); p["trail_pct"] = float(trail)
+        rows=[]
+        for _, setup in setup_df.iterrows():
+            code=str(setup["코드"]).zfill(6); d=data_map.get(code)
+            if d is None: continue
+            entry=make_entry(d, setup, ENTRY_MODE, p)
+            if entry is None: continue
+            ev=evaluate_trade(d, setup, entry, EXIT_MODE, p)
+            if ev is None: continue
+            row=setup.drop(labels=["_b","_pull_i","_breakout_i"], errors="ignore").to_dict()
+            row.update(entry); row.pop("_entry_i",None); row.pop("_eval_i",None); row.update(ev)
+            row["활성화(%)"]=activation; row["트레일폭(%)"]=trail
+            rows.append(row)
+        q=pd.DataFrame(rows)
+        if q.empty: continue
+        all_results.append(q)
+        ss=summarize(q)
+        grid_rows.append({"활성화(%)":activation,"트레일폭(%)":trail,**ss})
 
-    if setups.empty:
-        bar.empty()
-        status.warning("현재 조건에서는 setup이 없습니다.")
-        st.stop()
+    bar.empty(); status.success(f"완료 · {total}종목 / {years}년 · setup {len(setup_df)}건 · {len(grid_rows)}조합")
+    if not grid_rows: st.warning("실제 매매가 없습니다."); st.stop()
+    grid=pd.DataFrame(grid_rows).sort_values(["평균수익률(%)","손절률(%)"],ascending=[False,True]).reset_index(drop=True)
+    grid.insert(0,"순위",range(1,len(grid)+1))
+    st.subheader("X3 파라미터 강건성 순위")
+    st.dataframe(grid,use_container_width=True,hide_index=True)
 
-    results = []
-    combos = [(e, x) for e in ENTRY_MODES for x in EXIT_MODES]
-
-    for ci, (entry_mode, exit_mode) in enumerate(combos, 1):
-        status.info(f"2/2 조합 계산 {ci}/9 · {entry_mode} × {exit_mode}")
-        bar.progress(0.5 + ci / 18)
-
-        for _, setup in setups.iterrows():
-            code = setup["코드"]
-            if code not in data_map:
-                continue
-
-            d = data_map[code]
-            entry = make_entry(d, setup, entry_mode, p)
-            if entry is None:
-                continue
-
-            ev = evaluate_trade(d, setup, entry, exit_mode, p)
-            if ev is None:
-                continue
-
-            row = setup.drop(
-                labels=["_b", "_pull_i", "_breakout_i"]
-            ).to_dict()
-            row.update(entry)
-            row.pop("_entry_i", None)
-            row.pop("_eval_i", None)
-            row.update(ev)
-            row["진입전략"] = entry_mode
-            row["청산전략"] = exit_mode
-            results.append(row)
-
-    bar.empty()
-    status.success(
-        f"완료 · {total}종목 / {years}년 · setup {len(setups)}건 · 9조합 계산"
-    )
-
-    result = pd.DataFrame(results)
-
-    if result.empty:
-        st.warning("9개 조합 모두에서 실제 매매가 생성되지 않았습니다.")
-        st.stop()
-
-    summary_rows = []
-    for entry_mode in ENTRY_MODES:
-        for exit_mode in EXIT_MODES:
-            q = result[
-                (result["진입전략"] == entry_mode)
-                & (result["청산전략"] == exit_mode)
-            ]
-            if q.empty:
-                continue
-            s = summarize(q)
-            summary_rows.append({
-                "진입": entry_mode,
-                "청산": exit_mode,
-                **s
-            })
-
-    comp = pd.DataFrame(summary_rows)
-
-    # 최소 20건 우선, 부족하면 전체에서 순위.
-    eligible = comp[comp["신호"] >= 20].copy()
-    if eligible.empty:
-        eligible = comp.copy()
-
-    ranked = eligible.sort_values(
-        ["평균수익률(%)", "손절률(%)", "+5%(%)", "신호"],
-        ascending=[False, True, False, False]
-    ).reset_index(drop=True)
-    ranked.insert(0, "순위", range(1, len(ranked) + 1))
-
-    st.subheader("9조합 성과 비교")
-    st.dataframe(ranked, use_container_width=True, hide_index=True)
-
-    best = ranked.iloc[0]
-
+    best=grid.iloc[0]; ba=float(best["활성화(%)"]); bt=float(best["트레일폭(%)"])
+    result=pd.concat(all_results,ignore_index=True)
+    best_trades=result[(result["활성화(%)"]==ba)&(result["트레일폭(%)"]==bt)].copy()
     st.subheader("현재 1위")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("신호", int(best["신호"]))
-    c2.metric("승률", f'{best["승률(%)"]:.1f}%')
-    c3.metric("평균수익률", f'{best["평균수익률(%)"]:.2f}%')
-    c4.metric("손절률", f'{best["손절률(%)"]:.1f}%')
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("신호",int(best["신호"])); c2.metric("승률",f'{best["승률(%)"]:.1f}%')
+    c3.metric("평균수익률",f'{best["평균수익률(%)"]:.2f}%'); c4.metric("손절률",f'{best["손절률(%)"]:.1f}%')
+    st.markdown(f"**E1 돌파당일 / 활성 +{ba:g}% / 트레일 {bt:g}%**")
 
-    st.markdown(f'**진입:** {best["진입"]}  \n**청산:** {best["청산"]}')
+    st.subheader("아웃라이어 제거 스트레스 테스트")
+    stress=[]
+    ordered=best_trades.sort_values("최종수익률(%)",ascending=False)
+    for n in [0,1,3,5]:
+        q=ordered.iloc[n:].copy() if len(ordered)>n else pd.DataFrame()
+        if q.empty: continue
+        stress.append({"최고수익 제거":f"상위 {n}건" if n else "제거 없음",**summarize(q)})
+    st.dataframe(pd.DataFrame(stress),use_container_width=True,hide_index=True)
 
-    best_trades = result[
-        (result["진입전략"] == best["진입"])
-        & (result["청산전략"] == best["청산"])
-    ].copy()
+    st.subheader("연도별 성과")
+    best_trades["연도"]=pd.to_datetime(best_trades["진입일"]).dt.year
+    yr=[]
+    for y,q in best_trades.groupby("연도"):
+        yr.append({"연도":int(y),**summarize(q)})
+    st.dataframe(pd.DataFrame(yr).sort_values("연도"),use_container_width=True,hide_index=True)
+
+    st.subheader("종목별 성과 · 의존도 확인")
+    stock=[]
+    for (code,name),q in best_trades.groupby(["코드","종목명"]):
+        stock.append({"코드":code,"종목명":name,**summarize(q),"누적수익률합(%)":round(q["최종수익률(%)"].sum(),2)})
+    stock_df=pd.DataFrame(stock).sort_values("누적수익률합(%)",ascending=False)
+    st.dataframe(stock_df,use_container_width=True,hide_index=True)
 
     st.subheader("1위 조합 실제 거래")
-    cols = [
-        "시장","종목명","코드","기준봉일","눌림일","돌파일",
-        "진입일","진입가","진입설명","초기손절가",
-        "청산일","청산가","청산사유","최종수익률(%)",
-        "돌파거래량vs눌림(배)","돌파종가수익률(%)",
-        "MFE(%)","MAE(%)","+3%","+5%","+7%","+10%"
-    ]
-    available_cols = [c for c in cols if c in best_trades.columns]
-    st.dataframe(
-        best_trades[available_cols].sort_values("최종수익률(%)", ascending=False),
-        use_container_width=True,
-        hide_index=True
-    )
+    cols=["시장","종목명","코드","기준봉일","눌림일","돌파일","진입일","진입가","초기손절가","청산일","청산가","청산사유","최종수익률(%)","MFE(%)","MAE(%)","+3%","+5%","+7%","+10%"]
+    st.dataframe(best_trades[[c for c in cols if c in best_trades.columns]].sort_values("최종수익률(%)",ascending=False),use_container_width=True,hide_index=True)
 
-    st.subheader("진입 방식별 평균")
-    entry_rows = []
-    for e in ENTRY_MODES:
-        q = result[result["진입전략"] == e]
-        s = summarize(q)
-        entry_rows.append({"진입": e, **s})
-    st.dataframe(pd.DataFrame(entry_rows), use_container_width=True, hide_index=True)
-
-    st.subheader("청산 방식별 평균")
-    exit_rows = []
-    for x in EXIT_MODES:
-        q = result[result["청산전략"] == x]
-        s = summarize(q)
-        exit_rows.append({"청산": x, **s})
-    st.dataframe(pd.DataFrame(exit_rows), use_container_width=True, hide_index=True)
-
-    st.download_button(
-        "9조합 요약 CSV",
-        comp.to_csv(index=False).encode("utf-8-sig"),
-        "swing_v9_combo_summary.csv",
-        "text/csv",
-        use_container_width=True
-    )
-
-    st.download_button(
-        "전체 거래 CSV",
-        result.to_csv(index=False).encode("utf-8-sig"),
-        "swing_v9_all_trades.csv",
-        "text/csv",
-        use_container_width=True
-    )
-
+    st.download_button("v10 파라미터 요약 CSV",grid.to_csv(index=False).encode("utf-8-sig"),"swing_v10_grid_summary.csv","text/csv",use_container_width=True)
+    st.download_button("v10 1위 실제거래 CSV",best_trades.to_csv(index=False).encode("utf-8-sig"),"swing_v10_best_trades.csv","text/csv",use_container_width=True)
     if errors:
-        with st.expander(f"조회 실패 {len(errors)}건"):
-            st.write(errors)
+        with st.expander(f"조회 실패 {len(errors)}건"): st.write(errors)
 
-st.caption(
-    "주의: 일봉에서는 장중 순서를 정확히 알 수 없습니다. "
-    "같은 거래일에 손절가와 상승 목표가가 모두 관측되면 손절 우선으로 보수 처리합니다. "
-    "X3 트레일링은 당일 최고가가 아니라 전일까지 확인된 최고가만 사용합니다."
-)
+st.caption("일봉 백테스트 보수 원칙 유지: 같은 날 손절과 목표가가 함께 관측되면 손절 우선. X3 트레일은 당일 최고가가 아닌 전일까지 확정된 최고가로 계산합니다.")
