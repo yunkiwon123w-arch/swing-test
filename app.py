@@ -5,9 +5,9 @@ import time
 from datetime import date
 from io import BytesIO
 
-st.set_page_config(page_title="단기스윙 v11.0 고승률 연구", layout="wide")
-st.title("🎯 단기스윙 v11.0 · 승률 우선 + 수익률 동시 탐색")
-st.caption("v10.5는 봉인 · 개발표본에서 손절을 줄이는 진입조건 탐색 · 승률 최우선, 수익률/PF/MDD 동시 평가")
+st.set_page_config(page_title="단기스윙 v11.1 고승률 연구", layout="wide")
+st.title("🎯 단기스윙 v11.1 · 승률 우선 + 수익률 동시 탐색")
+st.caption("v10.5는 봉인 · KOSPI/KOSDAQ 균형 개발표본 · 승률 최우선, 수익률/PF/MDD 동시 평가")
 
 # ============================================================
 # 완전 동결된 전략값
@@ -839,21 +839,57 @@ def build_excel(sheets):
     return output.getvalue()
 
 
+
+def balanced_development_universe(listing, total_n):
+    """KOSPI/KOSDAQ을 가능한 한 50:50으로 구성."""
+    half = total_n // 2
+
+    kp = (
+        listing[listing["Market"] == "KOSPI"]
+        .sort_values("Code")
+        .head(half)
+        .copy()
+    )
+
+    kq = (
+        listing[listing["Market"] == "KOSDAQ"]
+        .sort_values("Code")
+        .head(half)
+        .copy()
+    )
+
+    picked = pd.concat([kp, kq], ignore_index=True)
+
+    # 홀수 또는 한 시장 종목 부족 시 남은 시장에서 보충
+    need = total_n - len(picked)
+    if need > 0:
+        used = set(picked["Code"])
+        extra = (
+            listing[~listing["Code"].isin(used)]
+            .sort_values(["Market", "Code"])
+            .head(need)
+            .copy()
+        )
+        picked = pd.concat([picked, extra], ignore_index=True)
+
+    return picked.head(total_n).reset_index(drop=True)
+
+
 # ============================================================
 # UI
 # ============================================================
 with st.sidebar:
-    st.header("v11.0 연구 설정")
+    st.header("v11.1 연구 설정")
     end_date = st.date_input("종료일", date(2026, 7, 31))
     years = st.selectbox("개발 기간", [3, 4, 5], index=2, format_func=lambda x: f"{x}년")
     universe_n = st.selectbox("개발 종목 수", [300, 500], index=1)
     min_trades = st.number_input("후보 최소 거래수", 20, 80, 30, 5)
     train_ratio = st.slider("조건탐색 IS 비율(%)", 50, 75, 60, 5)
-    run = st.button("▶ 고승률 조건 탐색", type="primary", use_container_width=True)
+    run = st.button("▶ v11.1 고승률 조건 탐색", type="primary", use_container_width=True)
 
 st.info(
     "v10.5 최종 독립검증 전략은 그대로 봉인합니다. "
-    "v11.0은 기존 개발표본에서 F1+F2를 출발점으로 손절 가능성이 높은 거래를 걸러내는 조건을 찾습니다. "
+    "v11.1은 KOSPI/KOSDAQ을 균형 표본으로 구성해 F1+F2를 출발점으로 손절 가능성이 높은 거래를 걸러냅니다. "
     "조건은 앞쪽 IS에서만 순위를 정하고, 뒤쪽 OOS에는 선택된 조건을 그대로 적용합니다."
 )
 
@@ -870,9 +906,17 @@ if run:
         st.exception(e)
         st.stop()
 
-    # v10.1~v10.4와 같은 개발군: Market+Code 정렬 첫 N종목
-    universe = listing.sort_values(["Market", "Code"]).head(int(universe_n)).copy().reset_index(drop=True)
+    # v11.1: KOSPI/KOSDAQ 균형 개발표본
+    universe = balanced_development_universe(listing, int(universe_n))
     total = len(universe)
+
+    kp_n = int((universe["Market"] == "KOSPI").sum())
+    kq_n = int((universe["Market"] == "KOSDAQ").sum())
+
+    st.write(
+        f"**개발표본 구성:** {total}종목 "
+        f"(KOSPI {kp_n} / KOSDAQ {kq_n})"
+    )
 
     progress = st.progress(0)
     status = st.empty()
@@ -957,7 +1001,17 @@ if run:
     ]), use_container_width=True, hide_index=True)
     st.write(f"**OOS 시작일:** {split_date}")
 
-    st.subheader("② IS에서만 고승률 조건 탐색")
+    st.subheader("② 기준전략 시장별 성과")
+    market_base_rows = []
+    for market in ["KOSPI", "KOSDAQ"]:
+        q = trades[trades["시장"] == market].copy()
+        if q.empty:
+            continue
+        market_base_rows.append({"시장": market, **performance_stats(q)})
+    market_base_df = pd.DataFrame(market_base_rows)
+    st.dataframe(market_base_df, use_container_width=True, hide_index=True)
+
+    st.subheader("③ IS에서만 고승률 조건 탐색")
     search_df, rules = search_high_winrate(is_df, int(min_trades))
     st.caption(
         "점수는 승률을 가장 크게 반영하되 평균수익률·PF·MDD·표본수를 함께 봅니다. "
@@ -978,7 +1032,7 @@ if run:
     oos_winner = apply_named_rules(oos_df, chosen_names, rules)
     all_winner = apply_named_rules(trades, chosen_names, rules)
 
-    st.subheader("③ IS 1위 조건 → OOS 고정 검증")
+    st.subheader("④ IS 1위 조건 → OOS 고정 검증")
     st.write(f"**선택 조건:** {winner_name}")
 
     compare = pd.DataFrame([
@@ -1010,7 +1064,7 @@ if run:
             "60% 승률 목표를 충족하지 못하면 이 조건을 최종전략으로 채택하지 않습니다."
         )
 
-    st.subheader("④ 상위 10개 후보의 OOS 실제 성과")
+    st.subheader("⑤ 상위 10개 후보의 OOS 실제 성과")
     oos_rows = []
     for _, rr in valid.head(10).iterrows():
         nm = rr["조건"]
@@ -1032,23 +1086,35 @@ if run:
     oos_compare = pd.DataFrame(oos_rows)
     st.dataframe(oos_compare, use_container_width=True, hide_index=True)
 
-    st.subheader("⑤ 1위 조건 연도별")
+    st.subheader("⑥ 1위 조건 연도별")
     yr = yearly_stats(all_winner)
     st.dataframe(yr, use_container_width=True, hide_index=True)
 
-    st.subheader("⑥ 1위 조건 시장별")
+    st.subheader("⑦ 1위 조건 시장별")
     mk = market_stats(all_winner)
     st.dataframe(mk, use_container_width=True, hide_index=True)
 
-    st.subheader("⑦ 1위 조건 시장국면별")
+    st.subheader("⑦-1 1위 조건 · 시장별 IS/OOS")
+    market_oos_rows = []
+    for market in ["KOSPI", "KOSDAQ"]:
+        qis = is_winner[is_winner["시장"] == market].copy()
+        qoos = oos_winner[oos_winner["시장"] == market].copy()
+        if not qis.empty:
+            market_oos_rows.append({"시장": market, "구간": "IS", **performance_stats(qis)})
+        if not qoos.empty:
+            market_oos_rows.append({"시장": market, "구간": "OOS", **performance_stats(qoos)})
+    market_oos_df = pd.DataFrame(market_oos_rows)
+    st.dataframe(market_oos_df, use_container_width=True, hide_index=True)
+
+    st.subheader("⑧ 1위 조건 시장국면별")
     rg = regime_stats(all_winner)
     st.dataframe(rg, use_container_width=True, hide_index=True)
 
-    st.subheader("⑧ 1위 조건 아웃라이어 제거")
+    st.subheader("⑨ 1위 조건 아웃라이어 제거")
     stress = stress_outliers(all_winner)
     st.dataframe(stress, use_container_width=True, hide_index=True)
 
-    st.subheader("⑨ 승/패 진입특성")
+    st.subheader("⑩ 승/패 진입특성")
     feature_cols = [
         "돌파종가수익률(%)","전고점20이격(%)","돌파봉등락률(%)",
         "돌파봉종가위치(%)","돌파봉윗꼬리비율(%)","돌파갭(%)",
@@ -1072,7 +1138,7 @@ if run:
     feat_df = pd.DataFrame(feat_rows)
     st.dataframe(feat_df, use_container_width=True, hide_index=True)
 
-    st.subheader("⑩ 전체 연구결과 Excel")
+    st.subheader("⑪ 전체 연구결과 Excel")
     frozen_df = pd.DataFrame([
         {"항목":"기준전략","값":"v10.5 F1+F2"},
         {"항목":"목적함수","값":"승률 최우선 + 평균수익률/PF/MDD/표본수"},
@@ -1087,18 +1153,20 @@ if run:
         "02_IS후보전체": search_df,
         "03_1위_IS_OOS": compare,
         "04_상위10_OOS": oos_compare,
-        "05_1위연도별": yr,
-        "06_1위시장별": mk,
-        "07_1위시장국면": rg,
-        "08_1위아웃라이어": stress,
-        "09_승패특성": feat_df,
-        "10_전체F1F2거래": trades,
-        "11_1위조건거래": all_winner,
+        "05_기준시장별": market_base_df,
+        "06_1위연도별": yr,
+        "07_1위시장별": mk,
+        "08_1위시장IS_OOS": market_oos_df,
+        "09_1위시장국면": rg,
+        "10_1위아웃라이어": stress,
+        "11_승패특성": feat_df,
+        "12_전체F1F2거래": trades,
+        "13_1위조건거래": all_winner,
     })
     st.download_button(
-        "📦 v11.0 전체 연구결과 Excel 다운로드",
+        "📦 v11.1 전체 연구결과 Excel 다운로드",
         data=excel_bytes,
-        file_name="swing_v11_0_high_winrate_research.xlsx",
+        file_name="swing_v11_1_balanced_high_winrate_research.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
@@ -1108,6 +1176,6 @@ if run:
             st.write(errors)
 
 st.caption(
-    "v11.0은 새 연구 브랜치입니다. v10.5 독립검증 결과는 변경하지 않습니다. "
+    "v11.1은 KOSPI/KOSDAQ 균형 연구 브랜치입니다. v10.5 독립검증 결과는 변경하지 않습니다. "
     "여기서 발견된 조건도 곧바로 실전 채택하지 않고, 다음 단계에서 다시 완전히 독립된 종목군으로 검증해야 합니다."
 )
