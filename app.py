@@ -4,9 +4,9 @@ import FinanceDataReader as fdr
 import time
 from datetime import date
 
-st.set_page_config(page_title="단기스윙 백테스트 v2", layout="wide")
-st.title("📈 단기스윙 백테스트 v2")
-st.caption("FDR/NAVER 실제 일봉 · 손절/목표가 선후관계 및 거래 종료 로직 보정")
+st.set_page_config(page_title="단기스윙 백테스트 v3", layout="wide")
+st.title("📈 단기스윙 백테스트 v3")
+st.caption("FDR/NAVER 실제 일봉 · 재돌파 확인 다음 거래일 시가 진입 방식")
 
 U = {
 "005930":"삼성전자","000660":"SK하이닉스","005380":"현대차","000270":"기아",
@@ -95,26 +95,31 @@ def find_signals(d, code, name, p, cut, end):
         if not base_ok:
             continue
 
-        # 기준봉 후 2~5거래일 중 눌림을 찾고, 다음 날 눌림 고가 돌파 시 진입
+        # 기준봉 후 2~5거래일 중 눌림을 찾는다.
+        # 눌림 다음 거래일의 고가가 눌림 고가를 돌파하면 '재돌파 확인일'로 기록한다.
+        # 실제 매수는 그 다음 거래일 시가에서 한다.
+        # 이렇게 하면 재돌파 확인일의 저가가 진입 전인지 후인지 알 수 없는 일봉 한계를 피할 수 있다.
         for k in range(2, 6):
             pull_i = b + k
-            entry_i = pull_i + 1
+            breakout_i = pull_i + 1
+            entry_i = breakout_i + 1
             if entry_i >= len(d):
                 break
 
             pull = d.iloc[pull_i]
+            breakout_day = d.iloc[breakout_i]
             ent = d.iloc[entry_i]
 
             pull_ok = (
                 pull["Volume"] <= x["Volume"] * p["pullback_ratio"]
                 and pull["Close"] > x["Low"]
             )
-            breakout = ent["High"] >= pull["High"]
+            breakout = breakout_day["High"] >= pull["High"]
             if not (pull_ok and breakout):
                 continue
 
-            # 갭상승이면 시가, 장중 돌파면 눌림봉 고가를 진입가로 사용
-            entry_price = max(float(ent["Open"]), float(pull["High"]))
+            # 재돌파 확인 다음 거래일 시가 매수
+            entry_price = float(ent["Open"])
             ev = evaluate_trade(
                 d, entry_i, entry_price, p["stop_loss"], p["holding_days"]
             )
@@ -127,6 +132,7 @@ def find_signals(d, code, name, p, cut, end):
                 "거래대금(억)": round(float(x["거래대금"]) / 1e8),
                 "거래량배수": round(float(x["Volume"] / x["AVG_VOL20"]), 2),
                 "눌림일": d.index[pull_i].date(),
+                "재돌파확인일": d.index[breakout_i].date(),
                 "진입일": d.index[entry_i].date(),
                 "진입가": round(entry_price),
             }
@@ -149,7 +155,7 @@ with st.sidebar:
     holding_days = st.number_input("관찰 거래일", 3, 30, 10)
     run = st.button("▶ 백테스트 실행", type="primary", use_container_width=True)
 
-st.info("v2: 손절 발생 시 즉시 거래를 종료하고, MFE/MAE도 청산일까지로 제한합니다.")
+st.info("v3: 눌림 고가 재돌파는 확인 신호로만 사용하고, 실제 진입은 다음 거래일 시가로 계산합니다.")
 
 if run:
     end_ts = pd.Timestamp(end_date)
@@ -242,4 +248,4 @@ if run:
         with st.expander(f"조회 실패 {len(errors)}건"):
             st.write(errors)
 
-st.caption("주의: 일봉에서는 장중 체결 순서를 알 수 없어 같은 날 손절가와 목표가를 모두 터치하면 손절 우선으로 보수 처리합니다.")
+st.caption("주의: 진입 후 같은 거래일에 손절가와 목표가를 모두 터치한 경우에는 일봉만으로 장중 순서를 알 수 없어 손절 우선으로 보수 처리합니다.")
