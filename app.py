@@ -4,9 +4,9 @@ import FinanceDataReader as fdr
 import time
 from datetime import date
 
-st.set_page_config(page_title="단기스윙 백테스트 v10.1", layout="wide")
+st.set_page_config(page_title="단기스윙 백테스트 v10.2", layout="wide")
 st.title("🧪 단기스윙 v10 · E1+X3 엣지 검증")
-st.caption("v9 1위 E1 돌파당일 + X3 트레일 고정 · 표본확대 · 아웃라이어/연도/종목/트레일 민감도 검증")
+st.caption("v10.1 1위 전략 고정 · 실전비용 · 최대낙폭(MDD) · 연속손실 · 시간순 OOS/WFA 검증")
 
 TARGETS = [3.0, 5.0, 7.0, 10.0]
 
@@ -304,6 +304,102 @@ def summarize(df):
         "평균MAE(%)": round(df["MAE(%)"].mean(), 2),
     }
 
+def apply_costs(df, buy_slip_pct, sell_slip_pct, fees_tax_pct):
+    """실전비용 단순 보수모델.
+    순수익률 = 총수익률 - 매수 슬리피지 - 매도 슬리피지 - 왕복 수수료/세금.
+    개별 증권사/시장별 실제 비용과는 다를 수 있으므로 사용자가 값을 조정한다.
+    """
+    q = df.copy()
+    total_cost = float(buy_slip_pct) + float(sell_slip_pct) + float(fees_tax_pct)
+    q["총비용(%)"] = round(total_cost, 4)
+    q["순수익률(%)"] = q["최종수익률(%)"] - total_cost
+    q["순이익"] = q["순수익률(%)"] > 0
+    return q
+
+def performance_stats(df, ret_col="순수익률(%)"):
+    if df.empty:
+        return {
+            "신호":0, "승률(%)":0.0, "평균수익률(%)":0.0, "중앙수익률(%)":0.0,
+            "MDD(%)":0.0, "최대연속손실":0, "ProfitFactor":None,
+            "누적복리수익률(%)":0.0
+        }
+
+    q = df.sort_values(["진입일", "코드"]).copy()
+    r = q[ret_col].astype(float) / 100.0
+
+    equity = (1.0 + r).cumprod()
+    peak = equity.cummax()
+    dd = (equity / peak - 1.0) * 100.0
+    mdd = float(dd.min()) if len(dd) else 0.0
+
+    streak = 0
+    max_streak = 0
+    for x in q[ret_col].astype(float):
+        if x <= 0:
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+
+    gains = q.loc[q[ret_col] > 0, ret_col].sum()
+    losses = q.loc[q[ret_col] <= 0, ret_col].sum()
+    pf = float(gains / abs(losses)) if losses < 0 else None
+
+    return {
+        "신호": len(q),
+        "승률(%)": round((q[ret_col] > 0).mean() * 100, 1),
+        "평균수익률(%)": round(q[ret_col].mean(), 2),
+        "중앙수익률(%)": round(q[ret_col].median(), 2),
+        "MDD(%)": round(mdd, 2),
+        "최대연속손실": int(max_streak),
+        "ProfitFactor": None if pf is None else round(pf, 2),
+        "누적복리수익률(%)": round((equity.iloc[-1] - 1.0) * 100.0, 2),
+    }
+
+def chronological_oos(df, train_ratio=0.60):
+    """시간순 holdout. 파라미터를 재최적화하지 않고 앞 구간/뒤 구간을 분리해 동일 전략의 지속성을 본다."""
+    q = df.sort_values(["진입일", "코드"]).reset_index(drop=True).copy()
+    if len(q) < 10:
+        return pd.DataFrame(), pd.DataFrame(), None
+
+    split_i = max(1, min(len(q)-1, int(len(q) * train_ratio)))
+    train = q.iloc[:split_i].copy()
+    test = q.iloc[split_i:].copy()
+    split_date = test.iloc[0]["진입일"]
+    return train, test, split_date
+
+def yearly_walkforward(df, ret_col="순수익률(%)"):
+    q = df.copy()
+    q["연도"] = pd.to_datetime(q["진입일"]).dt.year
+    rows = []
+    years = sorted(q["연도"].dropna().unique())
+
+    for y in years:
+        test = q[q["연도"] == y].copy()
+        prior = q[q["연도"] < y].copy()
+
+        test_stats = performance_stats(test, ret_col)
+        prior_avg = prior[ret_col].mean() if not prior.empty else float("nan")
+
+        rows.append({
+            "OOS연도": int(y),
+            "이전연도신호": len(prior),
+            "이전연도평균(%)": None if pd.isna(prior_avg) else round(prior_avg, 2),
+            **test_stats
+        })
+    return pd.DataFrame(rows)
+
+def equity_curve_table(df, ret_col="순수익률(%)"):
+    q = df.sort_values(["진입일", "코드"]).reset_index(drop=True).copy()
+    if q.empty:
+        return q
+    q["거래순번"] = range(1, len(q)+1)
+    q["자산배수"] = (1.0 + q[ret_col].astype(float)/100.0).cumprod()
+    q["누적수익률(%)"] = (q["자산배수"] - 1.0) * 100.0
+    q["고점자산배수"] = q["자산배수"].cummax()
+    q["Drawdown(%)"] = (q["자산배수"] / q["고점자산배수"] - 1.0) * 100.0
+    return q
+
 def choose_universe(listing, n):
     if n >= len(listing):
         return listing.copy()
@@ -313,14 +409,20 @@ def choose_universe(listing, n):
 ENTRY_MODE = "E1 돌파당일"
 EXIT_MODE = "X3 +3%후트레일"
 
+# v10.1에서 500종목·5년 표본의 1위였던 값을 고정한다.
+FROZEN_ACTIVATION = 2.0
+FROZEN_TRAIL = 2.0
+
 with st.sidebar:
-    st.header("v10.1 검증 설정")
+    st.header("v10.2 검증 설정")
     end_date = st.date_input("종료일", date(2026, 7, 31))
-    years = st.selectbox("검증 기간", [2, 3, 4, 5], index=3, format_func=lambda x: f"{x}년")
-    universe_n = st.selectbox("검증 종목 수", [200, 300, 500, 700], index=2)
+    years = st.selectbox("검증 기간", [3, 4, 5], index=2, format_func=lambda x: f"{x}년")
+    universe_n = st.selectbox("검증 종목 수", [300, 500, 700], index=1)
 
     st.divider()
-    st.subheader("기준 신호 · v9 유지")
+    st.subheader("전략 조건 · 동결")
+    st.write("E1 돌파당일")
+    st.write("X3 활성 +2% / 트레일 2%")
     base_rise = st.number_input("기준봉 상승률(%)", value=10.0, step=0.5)
     value_eok = st.number_input("기준봉 최소 거래대금(억)", value=1000, step=100)
     volume_mult = st.number_input("20일 거래량 배수", value=2.0, step=0.5)
@@ -329,34 +431,50 @@ with st.sidebar:
     holding_days = st.number_input("최대 보유 거래일", 3, 15, 5)
 
     st.divider()
-    st.subheader("X3 민감도")
-    activation_list = st.multiselect("트레일 활성화 수익률(%)", [2.0, 3.0, 4.0, 5.0], default=[2.0,3.0,4.0,5.0])
-    trail_list = st.multiselect("트레일 폭(%)", [2.0, 3.0, 4.0], default=[2.0,3.0,4.0])
-    run = st.button("▶ v10.1 강건성 검증", type="primary", use_container_width=True)
+    st.subheader("실전 비용")
+    buy_slip = st.number_input("매수 슬리피지(%)", value=0.10, step=0.05, format="%.2f")
+    sell_slip = st.number_input("매도 슬리피지(%)", value=0.10, step=0.05, format="%.2f")
+    fees_tax = st.number_input("왕복 수수료·세금 합계(%)", value=0.20, step=0.05, format="%.2f")
 
-st.info("핵심 검증: 500종목·5년 / E1 돌파당일 고정 / X3 활성화 2·3·4·5% × 트레일 2·3·4% / 최고수익 거래 제거 / 연도별·종목별 분해")
+    st.divider()
+    st.subheader("OOS")
+    train_ratio = st.slider("앞 구간(IS) 비율(%)", 50, 80, 60, 5)
+
+    run = st.button("▶ v10.2 실전 검증", type="primary", use_container_width=True)
+
+st.info(
+    "전략 파라미터는 더 최적화하지 않습니다. "
+    "E1 돌파당일 + 활성 +2% + 트레일 2%를 고정하고 "
+    "비용 차감 후 성과, MDD, 연속손실, 시간순 OOS, 연도별 Walk-Forward를 확인합니다."
+)
 
 if run:
-    if not activation_list or not trail_list:
-        st.warning("활성화 수익률과 트레일 폭을 1개 이상 선택하세요.")
-        st.stop()
-
     end_ts = pd.Timestamp(end_date)
     cut = end_ts - pd.DateOffset(years=years)
     start_ts = cut - pd.Timedelta(days=90)
     fetch_end = end_ts + pd.Timedelta(days=45)
-    base_p = {
-        "base_rise": base_rise, "value_eok": value_eok, "volume_mult": volume_mult,
-        "pullback_ratio": pullback_ratio / 100, "breakout_vol_cut": breakout_vol_cut,
-        "retest_days": 3, "retest_touch_pct": 2.0, "holding_days": int(holding_days),
-        "max_structural_risk": 7.0, "trail_pct": 3.0, "activation_pct": 3.0,
+
+    p = {
+        "base_rise": base_rise,
+        "value_eok": value_eok,
+        "volume_mult": volume_mult,
+        "pullback_ratio": pullback_ratio / 100,
+        "breakout_vol_cut": breakout_vol_cut,
+        "retest_days": 3,
+        "retest_touch_pct": 2.0,
+        "holding_days": int(holding_days),
+        "max_structural_risk": 7.0,
+        "trail_pct": FROZEN_TRAIL,
+        "activation_pct": FROZEN_ACTIVATION,
     }
 
     try:
         listing = stock_listing()
     except Exception as e:
         st.error(f"종목 목록 조회 실패: {type(e).__name__}")
+        st.exception(e)
         st.stop()
+
     universe = choose_universe(listing, int(universe_n))
     total = len(universe)
     bar = st.progress(0)
@@ -364,8 +482,11 @@ if run:
     setups, data_map, errors = [], {}, []
 
     for pos, (_, r) in enumerate(universe.iterrows(), 1):
-        code, name, market = str(r["Code"]).zfill(6), r["Name"], r["Market"]
-        status.write(f"데이터/신호 탐색 {pos}/{total} · {name}")
+        code = str(r["Code"]).zfill(6)
+        name = r["Name"]
+        market = r["Market"]
+        status.write(f"1/2 데이터/신호 탐색 {pos}/{total} · {name}")
+
         try:
             d = load_data(
                 code,
@@ -375,93 +496,204 @@ if run:
             if d is None or d.empty or len(d) < 80:
                 continue
 
-            # find_setups 내부에서 지표를 계산하므로 원본 d를 전달한다.
             found_rows, prepared = find_setups(
-                d, code, name, market, base_p, cut, end_ts
+                d, code, name, market, p, cut, end_ts
             )
-
             data_map[code] = prepared
-
             if found_rows:
                 setups.extend(found_rows)
+
         except Exception as e:
             errors.append(f"{name}({code}): {type(e).__name__}")
-        bar.progress(pos / total)
+
+        bar.progress(pos / (total * 2))
         time.sleep(0.01)
 
     if not setups:
-        bar.empty(); st.warning("조건을 만족한 setup이 없습니다."); st.stop()
-    setup_df = pd.DataFrame(setups)
+        bar.empty()
+        status.warning("조건을 만족한 setup이 없습니다.")
+        st.stop()
 
-    grid_rows, all_results = [], []
-    combos = [(a,t) for a in activation_list for t in trail_list]
-    for ci, (activation, trail) in enumerate(combos, 1):
-        status.write(f"X3 민감도 계산 {ci}/{len(combos)} · 활성 +{activation:g}% / 트레일 {trail:g}%")
-        p = dict(base_p); p["activation_pct"] = float(activation); p["trail_pct"] = float(trail)
-        rows=[]
-        for _, setup in setup_df.iterrows():
-            code=str(setup["코드"]).zfill(6); d=data_map.get(code)
-            if d is None: continue
-            entry=make_entry(d, setup, ENTRY_MODE, p)
-            if entry is None: continue
-            ev=evaluate_trade(d, setup, entry, EXIT_MODE, p)
-            if ev is None: continue
-            row=setup.drop(labels=["_b","_pull_i","_breakout_i"], errors="ignore").to_dict()
-            row.update(entry); row.pop("_entry_i",None); row.pop("_eval_i",None); row.update(ev)
-            row["활성화(%)"]=activation; row["트레일폭(%)"]=trail
-            rows.append(row)
-        q=pd.DataFrame(rows)
-        if q.empty: continue
-        all_results.append(q)
-        ss=summarize(q)
-        grid_rows.append({"활성화(%)":activation,"트레일폭(%)":trail,**ss})
+    setup_df = dedup_setups(pd.DataFrame(setups))
 
-    bar.empty(); status.success(f"완료 · {total}종목 / {years}년 · setup {len(setup_df)}건 · {len(grid_rows)}조합")
-    if not grid_rows: st.warning("실제 매매가 없습니다."); st.stop()
-    grid=pd.DataFrame(grid_rows).sort_values(["평균수익률(%)","손절률(%)"],ascending=[False,True]).reset_index(drop=True)
-    grid.insert(0,"순위",range(1,len(grid)+1))
-    st.subheader("X3 파라미터 강건성 순위")
-    st.dataframe(grid,use_container_width=True,hide_index=True)
+    rows = []
+    for idx, (_, setup) in enumerate(setup_df.iterrows(), 1):
+        code = str(setup["코드"]).zfill(6)
+        d = data_map.get(code)
+        if d is None:
+            continue
 
-    best=grid.iloc[0]; ba=float(best["활성화(%)"]); bt=float(best["트레일폭(%)"])
-    result=pd.concat(all_results,ignore_index=True)
-    best_trades=result[(result["활성화(%)"]==ba)&(result["트레일폭(%)"]==bt)].copy()
-    st.subheader("현재 1위")
-    c1,c2,c3,c4=st.columns(4)
-    c1.metric("신호",int(best["신호"])); c2.metric("승률",f'{best["승률(%)"]:.1f}%')
-    c3.metric("평균수익률",f'{best["평균수익률(%)"]:.2f}%'); c4.metric("손절률",f'{best["손절률(%)"]:.1f}%')
-    st.markdown(f"**E1 돌파당일 / 활성 +{ba:g}% / 트레일 {bt:g}%**")
+        entry = make_entry(d, setup, ENTRY_MODE, p)
+        if entry is None:
+            continue
 
-    st.subheader("아웃라이어 제거 스트레스 테스트")
-    stress=[]
-    ordered=best_trades.sort_values("최종수익률(%)",ascending=False)
-    for n in [0,1,3,5]:
-        q=ordered.iloc[n:].copy() if len(ordered)>n else pd.DataFrame()
-        if q.empty: continue
-        stress.append({"최고수익 제거":f"상위 {n}건" if n else "제거 없음",**summarize(q)})
-    st.dataframe(pd.DataFrame(stress),use_container_width=True,hide_index=True)
+        ev = evaluate_trade(d, setup, entry, EXIT_MODE, p)
+        if ev is None:
+            continue
 
-    st.subheader("연도별 성과")
-    best_trades["연도"]=pd.to_datetime(best_trades["진입일"]).dt.year
-    yr=[]
-    for y,q in best_trades.groupby("연도"):
-        yr.append({"연도":int(y),**summarize(q)})
-    st.dataframe(pd.DataFrame(yr).sort_values("연도"),use_container_width=True,hide_index=True)
+        row = setup.drop(
+            labels=["_b", "_pull_i", "_breakout_i"],
+            errors="ignore"
+        ).to_dict()
+        row.update(entry)
+        row.pop("_entry_i", None)
+        row.pop("_eval_i", None)
+        row.update(ev)
+        rows.append(row)
 
-    st.subheader("종목별 성과 · 의존도 확인")
-    stock=[]
-    for (code,name),q in best_trades.groupby(["코드","종목명"]):
-        stock.append({"코드":code,"종목명":name,**summarize(q),"누적수익률합(%)":round(q["최종수익률(%)"].sum(),2)})
-    stock_df=pd.DataFrame(stock).sort_values("누적수익률합(%)",ascending=False)
-    st.dataframe(stock_df,use_container_width=True,hide_index=True)
+        if len(setup_df):
+            bar.progress(0.5 + idx / (len(setup_df) * 2))
 
-    st.subheader("1위 조합 실제 거래")
-    cols=["시장","종목명","코드","기준봉일","눌림일","돌파일","진입일","진입가","초기손절가","청산일","청산가","청산사유","최종수익률(%)","MFE(%)","MAE(%)","+3%","+5%","+7%","+10%"]
-    st.dataframe(best_trades[[c for c in cols if c in best_trades.columns]].sort_values("최종수익률(%)",ascending=False),use_container_width=True,hide_index=True)
+    bar.empty()
 
-    st.download_button("v10 파라미터 요약 CSV",grid.to_csv(index=False).encode("utf-8-sig"),"swing_v10_grid_summary.csv","text/csv",use_container_width=True)
-    st.download_button("v10 1위 실제거래 CSV",best_trades.to_csv(index=False).encode("utf-8-sig"),"swing_v10_best_trades.csv","text/csv",use_container_width=True)
+    gross = pd.DataFrame(rows)
+    if gross.empty:
+        status.warning("실제 매매가 없습니다.")
+        st.stop()
+
+    t = apply_costs(gross, buy_slip, sell_slip, fees_tax)
+    status.success(
+        f"완료 · {total}종목 / {years}년 · setup {len(setup_df)}건 · 실제매매 {len(t)}건"
+    )
+
+    gross_stats = performance_stats(
+        t.assign(**{"총수익률임시": t["최종수익률(%)"]}),
+        "총수익률임시"
+    )
+    net_stats = performance_stats(t, "순수익률(%)")
+
+    st.subheader("① 비용 차감 전/후")
+    compare = pd.DataFrame([
+        {"구분": "비용 차감 전", **gross_stats},
+        {"구분": "비용 차감 후", **net_stats},
+    ])
+    st.dataframe(compare, use_container_width=True, hide_index=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("순평균수익률", f'{net_stats["평균수익률(%)"]:.2f}%')
+    c2.metric("순승률", f'{net_stats["승률(%)"]:.1f}%')
+    c3.metric("MDD", f'{net_stats["MDD(%)"]:.2f}%')
+    c4.metric("최대 연속손실", f'{net_stats["최대연속손실"]}회')
+
+    total_cost = float(buy_slip + sell_slip + fees_tax)
+    st.caption(
+        f"적용 총 비용: 거래당 {total_cost:.2f}% "
+        f"(매수 슬리피지 {buy_slip:.2f}% + 매도 슬리피지 {sell_slip:.2f}% + 수수료·세금 {fees_tax:.2f}%)."
+    )
+
+    st.subheader("② 시간순 OOS Holdout")
+    train, test, split_date = chronological_oos(t, train_ratio / 100.0)
+
+    if split_date is None:
+        st.warning("OOS 분할에 필요한 표본이 부족합니다.")
+    else:
+        oos_table = pd.DataFrame([
+            {"구간": f"IS 앞 {train_ratio}% · {len(train)}건", **performance_stats(train, "순수익률(%)")},
+            {"구간": f"OOS 뒤 {100-train_ratio}% · {len(test)}건", **performance_stats(test, "순수익률(%)")},
+        ])
+        st.write(f"**OOS 시작일:** {split_date}")
+        st.dataframe(oos_table, use_container_width=True, hide_index=True)
+
+        oos_stats = performance_stats(test, "순수익률(%)")
+        if oos_stats["평균수익률(%)"] > 0:
+            st.success(f'OOS 평균수익률 +{oos_stats["평균수익률(%)"]:.2f}% · 플러스 유지')
+        else:
+            st.error(f'OOS 평균수익률 {oos_stats["평균수익률(%)"]:.2f}% · 전략 엣지 재검토 필요')
+
+    st.subheader("③ 연도별 Walk-Forward")
+    wf = yearly_walkforward(t, "순수익률(%)")
+    st.caption(
+        "각 행의 OOS연도 성과는 그 연도의 실제 거래만 사용합니다. "
+        "전략 파라미터는 모든 연도에서 +2% 활성/2% 트레일로 고정되어 있습니다."
+    )
+    st.dataframe(wf, use_container_width=True, hide_index=True)
+
+    st.subheader("④ MDD / 누적수익 진단")
+    eq = equity_curve_table(t, "순수익률(%)")
+    eq_show = eq[
+        ["거래순번","진입일","종목명","코드","순수익률(%)","누적수익률(%)","Drawdown(%)"]
+    ].copy()
+    st.dataframe(
+        eq_show.sort_values("거래순번", ascending=False).head(100),
+        use_container_width=True,
+        hide_index=True
+    )
+    st.caption(
+        "누적복리/MDD는 모든 신호를 진입일 순서로 동일 비중 순차 체결한 진단값입니다. "
+        "동시 보유·자금배분을 반영한 포트폴리오 시뮬레이션은 아닙니다."
+    )
+
+    st.subheader("⑤ 아웃라이어 제거 · 비용 차감 후")
+    stress = []
+    ordered = t.sort_values("순수익률(%)", ascending=False)
+    for n in [0, 1, 3, 5, 10]:
+        q = ordered.iloc[n:].copy() if len(ordered) > n else pd.DataFrame()
+        if q.empty:
+            continue
+        stress.append({
+            "최고수익 제거": "제거 없음" if n == 0 else f"상위 {n}건",
+            **performance_stats(q, "순수익률(%)")
+        })
+    st.dataframe(pd.DataFrame(stress), use_container_width=True, hide_index=True)
+
+    st.subheader("⑥ 연도별 순성과")
+    t["연도"] = pd.to_datetime(t["진입일"]).dt.year
+    yr = []
+    for y, q in t.groupby("연도"):
+        yr.append({"연도": int(y), **performance_stats(q, "순수익률(%)")})
+    st.dataframe(
+        pd.DataFrame(yr).sort_values("연도"),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.subheader("⑦ 종목별 의존도")
+    stock = []
+    for (code, name), q in t.groupby(["코드", "종목명"]):
+        s = performance_stats(q, "순수익률(%)")
+        stock.append({
+            "코드": code,
+            "종목명": name,
+            **s,
+            "순수익률합(%)": round(q["순수익률(%)"].sum(), 2),
+        })
+    stock_df = pd.DataFrame(stock).sort_values("순수익률합(%)", ascending=False)
+    st.dataframe(stock_df, use_container_width=True, hide_index=True)
+
+    st.subheader("⑧ 실제 거래")
+    cols = [
+        "시장","종목명","코드","기준봉일","눌림일","돌파일","진입일","진입가",
+        "초기손절가","청산일","청산가","청산사유",
+        "최종수익률(%)","총비용(%)","순수익률(%)",
+        "MFE(%)","MAE(%)","+3%","+5%","+7%","+10%"
+    ]
+    st.dataframe(
+        t[[c for c in cols if c in t.columns]].sort_values("진입일", ascending=False),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.download_button(
+        "v10.2 OOS/WFA 요약 CSV",
+        wf.to_csv(index=False).encode("utf-8-sig"),
+        "swing_v10_2_walkforward.csv",
+        "text/csv",
+        use_container_width=True
+    )
+    st.download_button(
+        "v10.2 전체 거래 CSV",
+        t.to_csv(index=False).encode("utf-8-sig"),
+        "swing_v10_2_all_trades.csv",
+        "text/csv",
+        use_container_width=True
+    )
+
     if errors:
-        with st.expander(f"조회 실패 {len(errors)}건"): st.write(errors)
+        with st.expander(f"조회 실패 {len(errors)}건"):
+            st.write(errors)
 
-st.caption("일봉 백테스트 보수 원칙 유지: 같은 날 손절과 목표가가 함께 관측되면 손절 우선. X3 트레일은 당일 최고가가 아닌 전일까지 확정된 최고가로 계산합니다.")
+st.caption(
+    "v10.2는 전략 최적화판이 아니라 검증판입니다. "
+    "E1 돌파당일 + 활성 +2% + 트레일 2%를 고정합니다. "
+    "일봉에서 같은 날 손절과 목표가가 함께 관측되면 손절 우선으로 보수 처리합니다."
+)
