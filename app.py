@@ -4,9 +4,9 @@ import FinanceDataReader as fdr
 import time
 from datetime import date
 
-st.set_page_config(page_title="단기스윙 백테스트 v4.1", layout="wide")
-st.title("📈 단기스윙 백테스트 v4.1")
-st.caption("FDR/NAVER 실제 일봉 · 거래별 진입/손절/청산 검산 강화")
+st.set_page_config(page_title="단기스윙 백테스트 v5", layout="wide")
+st.title("📈 단기스윙 백테스트 v5")
+st.caption("FDR/NAVER 실제 일봉 · 중복 신호 제거 및 진입/청산 검산 강화")
 
 U = {
 "005930":"삼성전자","000660":"SK하이닉스","005380":"현대차","000270":"기아",
@@ -26,12 +26,6 @@ def load_data(code, start, end):
     return fdr.DataReader("NAVER:" + code, start, end)
 
 def evaluate_trade(d, entry_i, entry_price, stop_loss_pct, holding_days):
-    """일봉 기반 보수적 체결 모델.
-    - 진입은 entry_i 거래일 시가
-    - 손절가는 진입가 대비 stop_loss_pct
-    - 손절일 MAE는 실제 일중 저가가 아니라 '체결 가능한 손절가'까지만 반영
-    - 같은 날 손절가와 목표가를 모두 터치하면 장중 순서를 모르므로 손절 우선
-    """
     stop_price = entry_price * (1 + stop_loss_pct / 100.0)
     targets = [3.0, 5.0, 7.0, 10.0]
     target_hit = {t: False for t in targets}
@@ -52,14 +46,14 @@ def evaluate_trade(d, entry_i, entry_price, stop_loss_pct, holding_days):
         high_ret = (high / entry_price - 1) * 100.0
         low_ret = (low / entry_price - 1) * 100.0
 
-        # 손절 터치 여부를 먼저 판정한다.
         stop_hit = low <= stop_price
 
-        # 손절일에도 손절 체결 전 고가의 순서는 알 수 없으므로
-        # 목표가와 손절가가 같은 날 모두 터치되면 보수적으로 목표 미달 처리.
         if stop_hit:
-            mfe = max(mfe, max(0.0, high_ret) if high < entry_price * 1.03 else mfe)
-            mae = min(mae, stop_loss_pct)  # 손절 체결 이후 저가를 MAE에 포함하지 않음
+            # 손절일에는 손절가 이후 저가는 MAE에서 제외
+            mae = min(mae, stop_loss_pct)
+            # 같은 날 +3% 이상과 손절이 모두 터치되면 보수적으로 손절 우선
+            if high < entry_price * 1.03:
+                mfe = max(mfe, max(0.0, high_ret))
             exit_price = stop_price
             exit_i = i
             exit_reason = "손절"
@@ -121,10 +115,6 @@ def find_signals(d, code, name, p, cut, end):
         if not base_ok:
             continue
 
-        # 기준봉 후 2~5거래일 중 눌림을 찾는다.
-        # 눌림 다음 거래일의 고가가 눌림 고가를 돌파하면 '재돌파 확인일'로 기록한다.
-        # 실제 매수는 그 다음 거래일 시가에서 한다.
-        # 이렇게 하면 재돌파 확인일의 저가가 진입 전인지 후인지 알 수 없는 일봉 한계를 피할 수 있다.
         for k in range(2, 6):
             pull_i = b + k
             breakout_i = pull_i + 1
@@ -141,10 +131,10 @@ def find_signals(d, code, name, p, cut, end):
                 and pull["Close"] > x["Low"]
             )
             breakout = breakout_day["High"] >= pull["High"]
+
             if not (pull_ok and breakout):
                 continue
 
-            # 재돌파 확인 다음 거래일 시가 매수
             entry_price = float(ent["Open"])
             ev = evaluate_trade(
                 d, entry_i, entry_price, p["stop_loss"], p["holding_days"]
@@ -157,9 +147,21 @@ def find_signals(d, code, name, p, cut, end):
                 "기준봉(%)": round(float(x["등락률"]), 2),
                 "거래대금(억)": round(float(x["거래대금"]) / 1e8),
                 "거래량배수": round(float(x["Volume"] / x["AVG_VOL20"]), 2),
+
                 "눌림일": d.index[pull_i].date(),
+                "눌림고가": round(float(pull["High"])),
+                "눌림종가": round(float(pull["Close"])),
+
                 "재돌파확인일": d.index[breakout_i].date(),
+                "재돌파확인가": round(float(pull["High"])),
+                "재돌파일고가": round(float(breakout_day["High"])),
+                "재돌파일종가": round(float(breakout_day["Close"])),
+
                 "진입일": d.index[entry_i].date(),
+                "진입시가": round(float(ent["Open"])),
+                "진입고가": round(float(ent["High"])),
+                "진입저가": round(float(ent["Low"])),
+                "진입종가": round(float(ent["Close"])),
                 "진입가": round(entry_price),
             }
             row.update(ev)
@@ -181,7 +183,7 @@ with st.sidebar:
     holding_days = st.number_input("관찰 거래일", 3, 30, 10)
     run = st.button("▶ 백테스트 실행", type="primary", use_container_width=True)
 
-st.info("v4: 재돌파 확인 다음 거래일 시가 진입. 손절 발생 시 MAE를 손절가(-3%)까지만 인정하고 거래별 계산 근거를 표시합니다.")
+st.info("v5: 동일 종목+동일 진입일 중복 신호를 제거하고, 재돌파 가격 및 진입일 OHLC를 모두 표시합니다.")
 
 if run:
     end_ts = pd.Timestamp(end_date)
@@ -221,8 +223,25 @@ if run:
         time.sleep(0.05)
 
     progress.empty()
-    status.success(f"완료 · 매매신호 {len(rows)}건")
+
+    raw_count = len(rows)
     t = pd.DataFrame(rows)
+
+    if not t.empty:
+        # 동일 종목 + 동일 진입일이면 하나의 실제 매매로 간주.
+        # 여러 기준봉이 같은 거래를 만든 경우 가장 최근 기준봉만 남김.
+        t = (
+            t.sort_values(["코드", "진입일", "기준봉일"])
+             .drop_duplicates(subset=["코드", "진입일"], keep="last")
+             .reset_index(drop=True)
+        )
+
+    dedup_count = len(t)
+    status.success(f"완료 · 원신호 {raw_count}건 → 중복 제거 후 실제매매 {dedup_count}건")
+
+    c1, c2 = st.columns(2)
+    c1.metric("원신호", raw_count)
+    c2.metric("중복 제거 후 실제매매", dedup_count)
 
     if t.empty:
         st.warning("현재 조건에서는 매매신호가 없습니다.")
@@ -238,7 +257,7 @@ if run:
         )
 
         a, b, c, dcol = st.columns(4)
-        a.metric("신호", len(t))
+        a.metric("실제매매", len(t))
         b.metric("승률", f"{win_rate:.1f}%")
         c.metric("평균수익률", f"{avg_ret:.2f}%")
         dcol.metric("손절률", f'{t["손절"].mean()*100:.1f}%')
@@ -255,18 +274,31 @@ if run:
         c.metric("평균 이익", "-" if pd.isna(avg_win) else f"{avg_win:.2f}%")
         dcol.metric("손익비", "-" if pd.isna(payoff) else f"{payoff:.2f}")
 
-        st.subheader("거래별 결과")
-        st.caption("검산 순서: 기준봉일 → 눌림일 → 재돌파확인일 → 진입일/진입가 → 손절가 → 청산일/청산가/사유 → MFE/MAE")
+        st.subheader("거래별 검산 결과")
+        st.caption(
+            "기준봉 → 눌림일/눌림고가 → 재돌파확인일/재돌파가격 "
+            "→ 진입일 OHLC/진입가 → 손절가 → 청산일/청산가/사유 → MFE/MAE"
+        )
+
+        display_cols = [
+            "종목명","코드","기준봉일","기준봉(%)","거래대금(억)","거래량배수",
+            "눌림일","눌림고가","재돌파확인일","재돌파확인가",
+            "재돌파일고가","재돌파일종가",
+            "진입일","진입시가","진입고가","진입저가","진입종가","진입가",
+            "손절가","청산일","청산가","청산사유","손절","최종수익률(%)",
+            "MFE(%)","MAE(%)","+3%","+5%","+7%","+10%"
+        ]
+
         st.dataframe(
-            t.sort_values(["진입일", "종목명"], ascending=[False, True]),
+            t[display_cols].sort_values(["진입일", "종목명"], ascending=[False, True]),
             use_container_width=True,
             hide_index=True,
         )
 
         st.download_button(
             "CSV 다운로드",
-            t.to_csv(index=False).encode("utf-8-sig"),
-            "swing_backtest_v4_1.csv",
+            t[display_cols].to_csv(index=False).encode("utf-8-sig"),
+            "swing_backtest_v5.csv",
             "text/csv",
             use_container_width=True,
         )
@@ -275,4 +307,4 @@ if run:
         with st.expander(f"조회 실패 {len(errors)}건"):
             st.write(errors)
 
-st.caption("주의: 진입 후 같은 거래일에 손절가와 목표가를 모두 터치한 경우에는 일봉만으로 장중 순서를 알 수 없어 손절 우선으로 보수 처리합니다.")
+st.caption("주의: 진입 후 같은 거래일에 손절가와 목표가를 모두 터치한 경우 일봉만으로 장중 순서를 알 수 없어 손절 우선으로 보수 처리합니다.")
