@@ -4,9 +4,9 @@ import FinanceDataReader as fdr
 import time
 from datetime import date
 
-st.set_page_config(page_title="단기스윙 백테스트 v7.2", layout="wide")
-st.title("📊 단기스윙 v7.2 · 성공/실패 패턴 분석기")
-st.caption("B 진입 + 손절 -3% + 최대 5거래일 고정 · 성공군/실패군의 차이를 데이터로 분석")
+st.set_page_config(page_title="단기스윙 백테스트 v8.0", layout="wide")
+st.title("🧪 단기스윙 v8.0 · 재돌파 필터 전수검증")
+st.caption("B 진입 + 손절 -3% + 최대 5거래일 고정 · 재돌파 강도/거래량/거래대금 필터 조합을 동일 신호에서 전수검증")
 
 U = {
 "005930":"삼성전자","000660":"SK하이닉스","005380":"현대차","000270":"기아",
@@ -235,8 +235,52 @@ with st.sidebar:
 STOP = -3.0
 HOLD = 5
 
+# v7.2 성공/실패 비교에서 구분력이 컸던 3개 변수.
+# 0은 해당 필터를 적용하지 않는 기준선 역할.
+BREAKOUT_RET_CUTS = [0.0, 1.0, 2.0, 3.0, 4.0]
+BREAKOUT_VOL_CUTS = [0.0, 1.0, 1.2, 1.5, 1.8]
+VALUE_CUTS = [0, 1000, 3000, 5000, 10000]
+
+def grid_search_filters(t):
+    rows = []
+    base_n = len(t)
+    base_avg = t["최종수익률(%)"].mean()
+
+    for ret_cut in BREAKOUT_RET_CUTS:
+        for vol_cut in BREAKOUT_VOL_CUTS:
+            for value_cut in VALUE_CUTS:
+                q = t[
+                    (t["돌파종가수익률(%)"] >= ret_cut)
+                    & (t["돌파거래량vs눌림(배)"] >= vol_cut)
+                    & (t["거래대금(억)"] >= value_cut)
+                ].copy()
+                if q.empty:
+                    continue
+
+                s = summarize(q)
+                rows.append({
+                    "돌파수익률≥(%)": ret_cut,
+                    "돌파거래량≥(배)": vol_cut,
+                    "거래대금≥(억)": value_cut,
+                    "신호": s["신호"],
+                    "신호유지율(%)": round(len(q) / base_n * 100, 1),
+                    "승률(%)": s["승률(%)"],
+                    "평균수익률(%)": s["평균수익률(%)"],
+                    "기준대비개선(%p)": round(s["평균수익률(%)"] - base_avg, 2),
+                    "손절률(%)": s["손절률(%)"],
+                    "+3%(%)": s["+3%(%)"],
+                    "+5%(%)": s["+5%(%)"],
+                    "+7%(%)": s["+7%(%)"],
+                    "+10%(%)": s["+10%(%)"],
+                    "평균MFE(%)": s["평균MFE(%)"],
+                    "평균MAE(%)": s["평균MAE(%)"],
+                    "손익비": s["손익비"],
+                })
+    return pd.DataFrame(rows)
+
+
 st.info("전략 고정: B(눌림고가 돌파 당일 진입) · 손절 -3% · 최대 5거래일")
-st.caption("목적: 조건을 더 넣기 전에 성공군과 실패군에서 실제 차이가 나는 변수를 찾습니다.")
+st.caption("v7.2에서 구분력이 컸던 3개 변수의 컷을 조합해 신호수·승률·평균수익률·손절률·목표가 도달률을 비교합니다.")
 
 if run:
     end_ts = pd.Timestamp(end_date)
@@ -304,6 +348,77 @@ if run:
     c3.metric("평균수익률", f'{t["최종수익률(%)"].mean():.2f}%')
     c4.metric("손절률", f'{t["손절"].mean()*100:.1f}%')
 
+    st.subheader("① v8 · 3개 핵심 필터 전수검증")
+    st.caption(
+        "돌파종가수익률 × 돌파거래량/눌림거래량 × 기준봉 거래대금의 모든 조합을 계산합니다. "
+        "표본 과최적화를 줄이기 위해 최소 신호 수를 직접 선택해 비교하세요."
+    )
+
+    grid = grid_search_filters(t)
+    min_default = max(5, int(round(len(t) * 0.25)))
+    min_signals = st.number_input(
+        "순위표 최소 신호 수",
+        min_value=3,
+        max_value=max(3, len(t)),
+        value=min(min_default, len(t)),
+        step=1,
+        help="신호가 너무 적은 조합이 우연히 1위가 되는 것을 막기 위한 최소 표본 조건입니다.",
+    )
+
+    ranked = grid[grid["신호"] >= int(min_signals)].copy()
+    if ranked.empty:
+        st.warning("현재 최소 신호 수를 만족하는 조합이 없습니다. 최소 신호 수를 낮춰주세요.")
+    else:
+        ranked = ranked.sort_values(
+            ["평균수익률(%)", "손절률(%)", "+5%(%)", "신호"],
+            ascending=[False, True, False, False],
+        ).reset_index(drop=True)
+        ranked.insert(0, "순위", range(1, len(ranked) + 1))
+
+        best = ranked.iloc[0]
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("1위 신호", int(best["신호"]))
+        b2.metric("1위 승률", f'{best["승률(%)"]:.1f}%')
+        b3.metric("1위 평균수익률", f'{best["평균수익률(%)"]:.2f}%')
+        b4.metric("1위 손절률", f'{best["손절률(%)"]:.1f}%')
+
+        st.markdown(
+            f'**현재 1위 컷:** 돌파수익률 ≥ {best["돌파수익률≥(%)"]:.1f}% · '
+            f'돌파거래량 ≥ {best["돌파거래량≥(배)"]:.1f}배 · '
+            f'거래대금 ≥ {int(best["거래대금≥(억)"]):,}억'
+        )
+
+        topn = st.slider("상위 조합 표시", 5, min(50, len(ranked)), min(20, len(ranked)))
+        st.dataframe(ranked.head(topn), use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "v8 전체 조합 CSV",
+            grid.sort_values(["평균수익률(%)", "신호"], ascending=[False, False])
+                .to_csv(index=False).encode("utf-8-sig"),
+            "swing_v8_filter_grid.csv",
+            "text/csv",
+            use_container_width=True,
+        )
+
+        # 1위 조합에 해당하는 실제 거래도 바로 검산.
+        best_trades = t[
+            (t["돌파종가수익률(%)"] >= best["돌파수익률≥(%)"])
+            & (t["돌파거래량vs눌림(배)"] >= best["돌파거래량≥(배)"])
+            & (t["거래대금(억)"] >= best["거래대금≥(억)"])
+        ].copy()
+
+        st.subheader("② 현재 1위 조합 · 실제 거래")
+        best_cols = [
+            "종목명","코드","기준봉일","돌파일","진입가",
+            "돌파종가수익률(%)","돌파거래량vs눌림(배)","거래대금(억)",
+            "최종수익률(%)","손절","+3%","+5%","+7%","+10%","MFE(%)","MAE(%)"
+        ]
+        st.dataframe(
+            best_trades[best_cols].sort_values("최종수익률(%)", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )
+
     features = [
         "기준봉상승률(%)", "거래대금(억)", "기준봉거래량배수",
         "기준봉종가위치(%)", "기준봉5일선이격(%)", "기준봉20일선이격(%)",
@@ -332,11 +447,11 @@ if run:
     comp_df["차이절대값"] = comp_df["표준화차이"].abs()
     comp_df = comp_df.sort_values("차이절대값", ascending=False).drop(columns="차이절대값")
 
-    st.subheader("① 성공군 vs 실패군")
+    st.subheader("③ 성공군 vs 실패군")
     st.caption("표준화차이의 절대값이 클수록 두 집단을 구분할 가능성이 큰 변수입니다. 표본이 작으므로 확정 필터가 아니라 후보 탐색용입니다.")
     st.dataframe(comp_df, use_container_width=True, hide_index=True)
 
-    st.subheader("② 변수별 4구간 성과")
+    st.subheader("④ 변수별 4구간 성과")
     selected = st.selectbox("분석 변수", features)
 
     work = t[[selected, "최종수익률(%)", "손절", "+3%", "+5%", "+7%", "+10%"]].dropna().copy()
@@ -364,7 +479,7 @@ if run:
 
     st.dataframe(band, use_container_width=True, hide_index=True)
 
-    st.subheader("③ 모든 변수 구간별 요약")
+    st.subheader("⑤ 모든 변수 구간별 요약")
     all_bands = []
     for f in features:
         w = t[[f, "최종수익률(%)", "손절", "+5%"]].dropna().copy()
@@ -393,7 +508,7 @@ if run:
     bands_df = pd.DataFrame(all_bands)
     st.dataframe(bands_df, use_container_width=True, hide_index=True)
 
-    st.subheader("④ 거래별 원자료")
+    st.subheader("⑥ 거래별 원자료")
     show_cols = [
         "종목명","코드","기준봉일","돌파일","진입가","결과군",
         "최종수익률(%)","손절","MFE(%)","MAE(%)"
@@ -407,14 +522,14 @@ if run:
     st.download_button(
         "성공/실패 비교 CSV",
         comp_df.to_csv(index=False).encode("utf-8-sig"),
-        "swing_v7_2_success_fail_compare.csv",
+        "swing_v8_success_fail_compare.csv",
         "text/csv",
         use_container_width=True,
     )
     st.download_button(
         "거래별 분석자료 CSV",
         t.drop(columns=[], errors="ignore").to_csv(index=False).encode("utf-8-sig"),
-        "swing_v7_2_trades.csv",
+        "swing_v8_trades.csv",
         "text/csv",
         use_container_width=True,
     )
