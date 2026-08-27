@@ -4173,7 +4173,7 @@ def j2_pairwise_same_signal(df, mode1, mode2):
 
 
 # ============================================================
-# J6.1 — paper trading dashboard + watchlist tiers
+# J6.2 — funnel diagnostic dashboard
 # ============================================================
 
 J4_PRIOR60_MAX = 12.905
@@ -4363,6 +4363,172 @@ def j61_find_latest_candidates(listing, per_market, asof_date):
     return pd.DataFrame(rows), errors
 
 
+
+def j62_diagnostic_funnel(listing, per_market, asof_date):
+    """
+    Frozen strategy diagnostic.
+    Counts how many names survive each stage without changing J1/J4 rules.
+    """
+    start_ts = pd.Timestamp(asof_date) - pd.Timedelta(days=220)
+    fetch_end = pd.Timestamp(asof_date) + pd.Timedelta(days=1)
+
+    counts = {
+        "검색대상": 0,
+        "데이터충분": 0,
+        "J1구조발견": 0,
+        "최근45일 J1구조": 0,
+        "돌파후5일이내": 0,
+        "D진입발생": 0,
+        "5일선대기": 0,
+        "J4_전고점60통과": 0,
+        "J4_5일선이격통과": 0,
+        "A_완전통과": 0,
+    }
+
+    detail = []
+    errors = []
+
+    for market in ["KOSPI", "KOSDAQ"]:
+        universe = (
+            listing[listing["Market"] == market]
+            .sort_values("Code")
+            .head(int(per_market))
+            .copy()
+            .reset_index(drop=True)
+        )
+        counts["검색대상"] += len(universe)
+
+        for _, r in universe.iterrows():
+            code = str(r["Code"]).zfill(6)
+            name = r["Name"]
+            rec = {
+                "시장": market, "종목명": name, "코드": code,
+                "최종단계": "데이터조회전", "탈락사유": ""
+            }
+
+            try:
+                d = load_data(
+                    code,
+                    start_ts.strftime("%Y-%m-%d"),
+                    fetch_end.strftime("%Y-%m-%d")
+                )
+                if d is None or d.empty or len(d) < 160:
+                    rec["최종단계"] = "데이터부족"
+                    rec["탈락사유"] = "160봉 미만/데이터 없음"
+                    detail.append(rec)
+                    continue
+
+                counts["데이터충분"] += 1
+                rec["최종단계"] = "데이터충분"
+
+                found, prepared = j1_find_setups(
+                    d, code, name, market,
+                    pd.Timestamp(asof_date) - pd.Timedelta(days=45),
+                    pd.Timestamp(asof_date)
+                )
+                if not found:
+                    rec["탈락사유"] = "J1 구조 없음"
+                    detail.append(rec)
+                    continue
+
+                counts["J1구조발견"] += 1
+                counts["최근45일 J1구조"] += 1
+                rec["최종단계"] = "J1구조발견"
+
+                found = sorted(found, key=lambda x: pd.Timestamp(x["돌파일"]))
+                setup = found[-1]
+                br_i = int(setup["_breakout_i"])
+                last_i = len(prepared) - 1
+                elapsed = last_i - br_i
+                rec["돌파일"] = setup.get("돌파일")
+                rec["돌파후경과봉"] = elapsed
+                rec["전고점60이격(%)"] = setup.get("전고점60이격(%)")
+                rec["기준봉거래대금(억)"] = setup.get("기준봉거래대금(억)")
+                rec["구조거래량수축"] = setup.get("구조거래량수축")
+
+                if elapsed < 1 or elapsed > 5:
+                    rec["탈락사유"] = f"돌파 후 {elapsed}봉: 1~5봉 범위 밖"
+                    detail.append(rec)
+                    continue
+
+                counts["돌파후5일이내"] += 1
+                rec["최종단계"] = "돌파후5일이내"
+
+                p60 = pd.to_numeric(
+                    pd.Series([setup.get("전고점60이격(%)")]),
+                    errors="coerce"
+                ).iloc[0]
+                p60_ok = pd.notna(p60) and p60 <= J4_PRIOR60_MAX
+                if p60_ok:
+                    counts["J4_전고점60통과"] += 1
+
+                entries = [
+                    e for e in j2_make_entries(
+                        prepared, pd.Series(setup), wait_days=5
+                    )
+                    if e["진입전략"] == "D 5일선 눌림"
+                ]
+
+                if not entries:
+                    counts["5일선대기"] += 1
+                    rec["최종단계"] = "5일선대기"
+                    rec["탈락사유"] = (
+                        "D 첫 5일선 터치 미발생"
+                        if p60_ok else
+                        f"전고점60 이격 {p60:.2f}% > {J4_PRIOR60_MAX}%"
+                    )
+                    detail.append(rec)
+                    continue
+
+                counts["D진입발생"] += 1
+                e = entries[-1]
+                rec["진입일"] = e.get("진입일")
+                rec["진입가"] = e.get("진입가")
+                rec["진입5일선이격(%)"] = e.get("진입5일선이격(%)",
+                                               setup.get("진입5일선이격(%)"))
+
+                ma5gap = pd.to_numeric(
+                    pd.Series([rec.get("진입5일선이격(%)")]),
+                    errors="coerce"
+                ).iloc[0]
+                ma5_ok = pd.notna(ma5gap) and ma5gap <= J4_MA5_GAP_MAX
+
+                if ma5_ok:
+                    counts["J4_5일선이격통과"] += 1
+
+                if p60_ok and ma5_ok:
+                    counts["A_완전통과"] += 1
+                    rec["최종단계"] = "A완전통과"
+                    rec["탈락사유"] = ""
+                else:
+                    rec["최종단계"] = "J4필터"
+                    reasons = []
+                    if not p60_ok:
+                        reasons.append(
+                            f"전고점60 {p60:.2f}% > {J4_PRIOR60_MAX}%"
+                            if pd.notna(p60) else "전고점60 값 없음"
+                        )
+                    if not ma5_ok:
+                        reasons.append(
+                            f"5일선이격 {ma5gap:.2f}% > {J4_MA5_GAP_MAX}%"
+                            if pd.notna(ma5gap) else "5일선이격 값 없음"
+                        )
+                    rec["탈락사유"] = " / ".join(reasons)
+
+                detail.append(rec)
+
+            except Exception as e:
+                rec["최종단계"] = "오류"
+                rec["탈락사유"] = type(e).__name__
+                detail.append(rec)
+                errors.append(f"{market} {name}({code}): {type(e).__name__}")
+
+    funnel = pd.DataFrame([
+        {"단계": k, "종목수": v} for k, v in counts.items()
+    ])
+    detail_df = pd.DataFrame(detail)
+    return funnel, detail_df, errors
+
 def j6_priority_score(df):
     q = df.copy()
 
@@ -4482,16 +4648,13 @@ st.set_page_config(
 )
 
 st.title(
-    "🟢 J6.1 · 모의매매 운영판 + 관찰리스트"
+    "🟢 J6.2 · 후보 0건 원인 진단판"
 )
 
-st.caption(
-    "완전 통과 / 5일선 대기 / 근접 관찰을 분리 · "
-    "실제 모의매수는 A 완전통과만"
-)
+st.caption("조건은 변경하지 않고, 어느 단계에서 후보가 사라지는지 카운트합니다.")
 
 with st.sidebar:
-    st.header("J6.1 운용 설정")
+    st.header("J6.2 진단 설정")
 
     asof_date = st.date_input(
         "기준일",
@@ -4567,6 +4730,48 @@ if run:
         )
         st.exception(e)
         st.stop()
+
+    with st.spinner(
+        "J6.2 단계별 탈락 원인을 진단 중입니다..."
+    ):
+        funnel, diagnostic_detail, diagnostic_errors = j62_diagnostic_funnel(
+            listing,
+            int(per_market),
+            pd.Timestamp(asof_date)
+        )
+
+    st.subheader("② 단계별 후보 Funnel")
+    st.dataframe(funnel, use_container_width=True, hide_index=True)
+
+    if not funnel.empty:
+        vals = dict(zip(funnel["단계"], funnel["종목수"]))
+        st.write(
+            f"검색 {vals.get('검색대상',0)} → "
+            f"데이터충분 {vals.get('데이터충분',0)} → "
+            f"J1구조 {vals.get('J1구조발견',0)} → "
+            f"돌파후5일 {vals.get('돌파후5일이내',0)} → "
+            f"D진입 {vals.get('D진입발생',0)} → "
+            f"A완전통과 {vals.get('A_완전통과',0)}"
+        )
+
+    st.subheader("③ 종목별 최종 탈락 단계")
+    if diagnostic_detail.empty:
+        st.info("진단 상세 데이터가 없습니다.")
+    else:
+        st.dataframe(
+            diagnostic_detail,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        stage_summary = (
+            diagnostic_detail.groupby(["최종단계","탈락사유"], dropna=False)
+            .size()
+            .reset_index(name="종목수")
+            .sort_values("종목수", ascending=False)
+        )
+        st.subheader("④ 주요 탈락 원인")
+        st.dataframe(stage_summary, use_container_width=True, hide_index=True)
 
     with st.spinner(
         "완전통과·대기·근접 후보를 검색 중입니다..."
@@ -4720,25 +4925,29 @@ if run:
 
         sheets = {
             "00_설정": settings,
-            "01_현황": summary,
-            "02_A완전통과": plan if not a_df.empty else a_df,
-            "03_B5일선대기": b_df,
-            "04_C근접관찰": c_df,
-            "05_전체후보": candidates,
+            "01_진단Funnel": funnel,
+            "02_진단상세": diagnostic_detail,
+            "03_현황": summary,
+            "04_A완전통과": plan if not a_df.empty else a_df,
+            "05_B5일선대기": b_df,
+            "06_C근접관찰": c_df,
+            "07_전체후보": candidates,
         }
 
         excel_bytes = build_excel(sheets)
 
         st.download_button(
-            "📦 J6.1 오늘 후보/관찰 Excel 다운로드",
+            "📦 J6.2 진단 Excel 다운로드",
             data=excel_bytes,
             file_name=(
-                f"J6_1_watchlist_"
+                f"J6_2_diagnostic_"
                 f"{pd.Timestamp(asof_date).strftime('%Y%m%d')}.xlsx"
             ),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
+
+    errors = list(diagnostic_errors) + list(errors)
 
     if errors:
         with st.expander(
@@ -4788,6 +4997,6 @@ if calc_entry > 0 and calc_current > 0 and calc_high > 0:
     )
 
 st.caption(
-    "J6.1은 관찰리스트를 추가한 모의매매 운영판입니다. "
+    "J6.2는 조건을 변경하지 않고 후보가 사라지는 단계를 진단하는 운영판입니다. "
     "B/C 등급은 매수 조건이 아니며, A 완전통과만 실제 모의매매 대상으로 사용합니다."
 )
