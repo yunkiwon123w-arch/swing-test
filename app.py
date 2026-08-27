@@ -4170,12 +4170,15 @@ def j2_pairwise_same_signal(df, mode1, mode2):
 # ============================================================
 
 
+
 # ============================================================
-# J5.1 — daily mark-to-market portfolio simulation
+# J6 v1.0 — paper trading operations dashboard
 # ============================================================
 
 J4_PRIOR60_MAX = 12.905
 J4_MA5_GAP_MAX = 12.85
+J6_MAX_POSITIONS = 3
+
 J4_RULE_TEXT = (
     f"전고점60이격(%) <= {J4_PRIOR60_MAX} "
     f"AND 진입5일선이격(%) <= {J4_MA5_GAP_MAX}"
@@ -4190,504 +4193,29 @@ def j4_apply_rule(df):
     ].copy()
 
 
-def j51_prepare_close_maps(data_map):
+def j6_find_latest_candidates(listing, per_market, asof_date):
     """
-    data_map[(시장, 코드)] -> 가격 DataFrame.
-    일별 종가를 빠르게 찾기 위한 dict 생성.
+    오늘 기준 최근 J1 구조 신호 중 아직 D=5일선 눌림 진입이 가능한 후보를 찾는다.
+    과거 백테스트처럼 전체 기간을 평가하지 않고, 현재 시점에서 '후보 상태'만 만든다.
     """
-    close_maps = {}
-    all_dates = set()
-
-    for key, d in data_map.items():
-        if d is None or d.empty or "Close" not in d.columns:
-            continue
-
-        ser = pd.to_numeric(d["Close"], errors="coerce").dropna()
-        ser = ser[ser > 0]
-
-        cmap = {
-            pd.Timestamp(idx).normalize(): float(v)
-            for idx, v in ser.items()
-        }
-
-        if cmap:
-            close_maps[key] = cmap
-            all_dates.update(cmap.keys())
-
-    return close_maps, sorted(all_dates)
-
-
-def j51_portfolio_sim(
-    trades,
-    data_map,
-    initial_cash=10_000_000,
-    max_positions=5,
-    market_filter="전체"
-):
-    """
-    실제 일별 평가 방식:
-    - 청산일에는 청산을 먼저 반영
-    - 그 후 당일 신규 진입
-    - 보유종목은 매일 종가로 평가
-    - 해당일 종가가 없으면 가장 최근 유효 종가를 유지
-    - 동시보유 한도 초과 신호는 미체결
-    """
-    q = trades.copy()
-
-    if market_filter != "전체":
-        q = q[q["시장"] == market_filter].copy()
-
-    if q.empty:
-        return pd.DataFrame(), pd.DataFrame(), {}
-
-    q["진입일_ts"] = pd.to_datetime(q["진입일"]).dt.normalize()
-    q["청산일_ts"] = pd.to_datetime(q["청산일"]).dt.normalize()
-    q = q.sort_values(
-        ["진입일_ts", "코드"]
-    ).reset_index(drop=True)
-
-    close_maps, all_price_dates = j51_prepare_close_maps(data_map)
-
-    start_date = q["진입일_ts"].min()
-    end_date = q["청산일_ts"].max()
-
-    # 검증기간 안의 실제 거래일만 사용
-    sim_dates = [
-        d for d in all_price_dates
-        if start_date <= d <= end_date
-    ]
-
-    # 데이터 누락 방지: 진입/청산일은 반드시 포함
-    sim_dates = sorted(
-        set(sim_dates)
-        | set(q["진입일_ts"])
-        | set(q["청산일_ts"])
-    )
-
-    cash = float(initial_cash)
-    open_positions = []
-    ledger = []
-    curve = []
-
-    skipped = 0
-    max_open = 0
-    last_mark = {}
-
-    for dt in sim_dates:
-        # 1) 청산 먼저
-        exiting = [
-            p for p in open_positions
-            if p["청산일_ts"] <= dt
-        ]
-
-        for p in exiting:
-            proceeds = (
-                p["투자금"]
-                * (1 + float(p["순수익률(%)"]) / 100.0)
-            )
-
-            cash += proceeds
-            p["실현손익"] = proceeds - p["투자금"]
-            p["청산후현금"] = cash
-            ledger.append(p.copy())
-
-        open_positions = [
-            p for p in open_positions
-            if p["청산일_ts"] > dt
-        ]
-
-        # 2) 신규 진입
-        todays = q[q["진입일_ts"] == dt]
-
-        for _, r in todays.iterrows():
-            if len(open_positions) >= int(max_positions):
-                skipped += 1
-                continue
-
-            slots = int(max_positions) - len(open_positions)
-
-            if slots <= 0 or cash <= 0:
-                skipped += 1
-                continue
-
-            invest = cash / slots
-
-            if invest <= 0:
-                skipped += 1
-                continue
-
-            entry_price = float(r["진입가"])
-
-            if not np.isfinite(entry_price) or entry_price <= 0:
-                skipped += 1
-                continue
-
-            cash -= invest
-
-            p = r.to_dict()
-            p["투자금"] = invest
-            p["수량환산"] = invest / entry_price
-            p["진입전현금"] = cash + invest
-
-            open_positions.append(p)
-            max_open = max(max_open, len(open_positions))
-
-            key = (
-                str(r["시장"]),
-                str(r["코드"]).zfill(6)
-            )
-            last_mark[key] = entry_price
-
-        # 3) 일일 종가 평가
-        market_value = 0.0
-
-        for p in open_positions:
-            key = (
-                str(p["시장"]),
-                str(p["코드"]).zfill(6)
-            )
-
-            cmap = close_maps.get(key, {})
-            px = cmap.get(dt)
-
-            if px is not None and np.isfinite(px) and px > 0:
-                last_mark[key] = float(px)
-
-            mark = last_mark.get(
-                key,
-                float(p["진입가"])
-            )
-
-            market_value += (
-                float(p["수량환산"])
-                * float(mark)
-            )
-
-        equity = cash + market_value
-
-        curve.append({
-            "일자": dt.date(),
-            "현금": round(cash, 0),
-            "보유평가액": round(market_value, 0),
-            "계좌자산": round(equity, 0),
-            "보유종목수": len(open_positions),
-            "현금비중(%)": round(
-                cash / equity * 100,
-                2
-            ) if equity > 0 else None,
-        })
-
-    # 방어적으로 남은 포지션 청산
-    for p in list(open_positions):
-        proceeds = (
-            p["투자금"]
-            * (1 + float(p["순수익률(%)"]) / 100.0)
-        )
-        cash += proceeds
-        p["실현손익"] = proceeds - p["투자금"]
-        p["청산후현금"] = cash
-        ledger.append(p.copy())
-
-    led = pd.DataFrame(ledger)
-    eq = pd.DataFrame(curve)
-
-    if led.empty or eq.empty:
-        return led, eq, {}
-
-    led = led.sort_values(
-        ["청산일_ts", "진입일_ts"]
-    ).reset_index(drop=True)
-
-    eq["계좌자산"] = pd.to_numeric(
-        eq["계좌자산"],
-        errors="coerce"
-    )
-
-    eq["고점자산"] = eq["계좌자산"].cummax()
-    eq["DD(%)"] = (
-        eq["계좌자산"]
-        / eq["고점자산"]
-        - 1
-    ) * 100
-
-    eq["일간수익률(%)"] = (
-        eq["계좌자산"].pct_change()
-        * 100
-    )
-
-    final_asset = float(
-        initial_cash + led["실현손익"].sum()
-    )
-
-    total_return = (
-        final_asset / initial_cash - 1
-    ) * 100
-
-    start = pd.Timestamp(eq["일자"].iloc[0])
-    end = pd.Timestamp(eq["일자"].iloc[-1])
-    years = max(
-        (end - start).days / 365.25,
-        1 / 365.25
-    )
-
-    cagr = (
-        (final_asset / initial_cash) ** (1 / years) - 1
-    ) * 100 if final_asset > 0 else -100.0
-
-    ret = pd.to_numeric(
-        led["순수익률(%)"],
-        errors="coerce"
-    )
-
-    stats = {
-        "시장": market_filter,
-        "최대동시보유설정": int(max_positions),
-        "초기자금": int(initial_cash),
-        "최종자산": round(final_asset),
-        "총수익률(%)": round(total_return, 2),
-        "CAGR(%)": round(cagr, 2),
-        "실제체결": len(led),
-        "승률(%)": round(
-            (ret > 0).mean() * 100,
-            1
-        ),
-        "평균거래수익률(%)": round(
-            ret.mean(),
-            2
-        ),
-        "일별계좌MDD(%)": round(
-            float(eq["DD(%)"].min()),
-            2
-        ),
-        "최대동시보유실제": int(max_open),
-        "미체결신호": int(skipped),
-        "신호체결률(%)": round(
-            len(led)
-            / (len(led) + skipped)
-            * 100,
-            1
-        ) if len(led) + skipped else 0,
-        "평균현금비중(%)": round(
-            pd.to_numeric(
-                eq["현금비중(%)"],
-                errors="coerce"
-            ).mean(),
-            1
-        ),
-    }
-
-    return led, eq, stats
-
-
-def j51_yearly_equity(curve):
-    if curve.empty:
-        return pd.DataFrame()
-
-    q = curve.copy()
-    q["일자"] = pd.to_datetime(q["일자"])
-    q["연도"] = q["일자"].dt.year
+    start_ts = pd.Timestamp(asof_date) - pd.Timedelta(days=220)
+    fetch_end = pd.Timestamp(asof_date) + pd.Timedelta(days=1)
 
     rows = []
-
-    for y, g in q.groupby("연도"):
-        g = g.sort_values("일자")
-        start_asset = float(g["계좌자산"].iloc[0])
-        end_asset = float(g["계좌자산"].iloc[-1])
-
-        peak = g["계좌자산"].cummax()
-        dd = (
-            g["계좌자산"] / peak - 1
-        ) * 100
-
-        rows.append({
-            "연도": int(y),
-            "연초계좌자산": round(start_asset),
-            "연말계좌자산": round(end_asset),
-            "연도수익률(%)": round(
-                (end_asset / start_asset - 1) * 100,
-                2
-            ) if start_asset else None,
-            "연도MDD(%)": round(
-                float(dd.min()),
-                2
-            ),
-        })
-
-    return pd.DataFrame(rows)
-
-
-def j51_compare_scenarios(selected, data_map, initial_cash):
-    summaries = []
-    ledgers = {}
-    curves = {}
-    yearly = {}
-
-    for max_pos in [3, 5]:
-        for market in ["전체", "KOSPI", "KOSDAQ"]:
-            led, curve, stats = j51_portfolio_sim(
-                selected,
-                data_map,
-                int(initial_cash),
-                int(max_pos),
-                market
-            )
-
-            key = f"{market}_{max_pos}종목"
-            ledgers[key] = led
-            curves[key] = curve
-            yearly[key] = j51_yearly_equity(curve)
-
-            if stats:
-                summaries.append(stats)
-
-    return (
-        pd.DataFrame(summaries),
-        ledgers,
-        curves,
-        yearly
-    )
-
-
-# ============================================================
-# UI
-# ============================================================
-st.set_page_config(
-    page_title="J5.1 일별 실전 MDD 검증",
-    layout="wide"
-)
-
-st.title(
-    "📉 J5.1 · 일별 Mark-to-Market 실전 위험도 검증"
-)
-
-st.caption(
-    "J4 전략 완전 고정 · 보유종목 매일 종가평가 · "
-    "3종목 vs 5종목 · 전체/KOSPI/KOSDAQ"
-)
-
-with st.sidebar:
-    st.header("J5.1 설정")
-
-    end_date = st.date_input(
-        "종료일",
-        date(2026, 7, 31)
-    )
-
-    years = st.selectbox(
-        "검증 기간",
-        [3, 4, 5],
-        index=2,
-        format_func=lambda x: f"{x}년"
-    )
-
-    skip_per_market = st.number_input(
-        "선행 종목 수",
-        min_value=0,
-        max_value=1000,
-        value=300,
-        step=50
-    )
-
-    validation_per_market = st.selectbox(
-        "시장별 검증 종목 수",
-        [100, 200, 300],
-        index=2
-    )
-
-    wait_days = st.selectbox(
-        "5일선 눌림 최대 대기",
-        [3, 5, 7],
-        index=1
-    )
-
-    initial_cash = st.number_input(
-        "초기자금(원)",
-        min_value=1_000_000,
-        max_value=1_000_000_000,
-        value=10_000_000,
-        step=1_000_000
-    )
-
-    run = st.button(
-        "▶ J5.1 일별 MDD 검증",
-        type="primary",
-        use_container_width=True
-    )
-
-st.info(
-    f"고정전략: D=첫 5일선 눌림 + {J4_RULE_TEXT}. "
-    "J5.1에서는 전략 조건을 바꾸지 않습니다. "
-    "J5와 달리 보유 중인 종목을 매 거래일 종가로 평가해 "
-    "실제 계좌 Equity Curve와 MDD를 계산합니다."
-)
-
-if run:
-    end_ts = pd.Timestamp(end_date)
-    cut = end_ts - pd.DateOffset(
-        years=int(years)
-    )
-
-    start_ts = cut - pd.Timedelta(
-        days=220
-    )
-
-    fetch_end = end_ts + pd.Timedelta(
-        days=60
-    )
-
-    try:
-        listing = stock_listing()
-    except Exception as e:
-        st.error(
-            f"종목 목록 조회 실패: "
-            f"{type(e).__name__}"
-        )
-        st.exception(e)
-        st.stop()
-
-    universes = {}
+    errors = []
 
     for market in ["KOSPI", "KOSDAQ"]:
-        m = (
-            listing[
-                listing["Market"] == market
-            ]
+        universe = (
+            listing[listing["Market"] == market]
             .sort_values("Code")
+            .head(int(per_market))
+            .copy()
             .reset_index(drop=True)
         )
 
-        universes[market] = m.iloc[
-            int(skip_per_market):
-            int(skip_per_market)
-            + int(validation_per_market)
-        ].copy()
-
-    total = sum(
-        len(v)
-        for v in universes.values()
-    )
-
-    done = 0
-    setups = []
-    data_map = {}
-    errors = []
-
-    progress = st.progress(0)
-    status = st.empty()
-
-    for market, universe in universes.items():
         for _, r in universe.iterrows():
-            done += 1
-
-            code = str(
-                r["Code"]
-            ).zfill(6)
-
+            code = str(r["Code"]).zfill(6)
             name = r["Name"]
-
-            status.info(
-                f"{market} {done}/{total} · {name}"
-            )
 
             try:
                 d = load_data(
@@ -4696,385 +4224,566 @@ if run:
                     fetch_end.strftime("%Y-%m-%d")
                 )
 
-                if (
-                    d is None
-                    or d.empty
-                    or len(d) < 160
-                ):
-                    progress.progress(
-                        done / max(total, 1)
-                    )
+                if d is None or d.empty or len(d) < 160:
                     continue
 
+                # latest few months only
                 found, prepared = j1_find_setups(
                     d,
                     code,
                     name,
                     market,
-                    cut,
-                    end_ts
+                    pd.Timestamp(asof_date) - pd.Timedelta(days=45),
+                    pd.Timestamp(asof_date)
                 )
 
-                data_map[
-                    (market, code)
-                ] = prepared
+                if not found:
+                    continue
 
-                if found:
-                    setups.extend(found)
+                # only latest structure per stock
+                found = sorted(found, key=lambda x: pd.Timestamp(x["돌파일"]))
+                setup = found[-1]
+
+                entries = [
+                    e for e in j2_make_entries(
+                        prepared,
+                        pd.Series(setup),
+                        wait_days=5
+                    )
+                    if e["진입전략"] == "D 5일선 눌림"
+                ]
+
+                # If D entry already occurred in history, candidate is no longer fresh.
+                # Only retain if entry date is very recent (today or last 2 trading/calendar days).
+                if entries:
+                    e = entries[-1]
+                    entry_date = pd.Timestamp(e["진입일"])
+                    age_days = (pd.Timestamp(asof_date).normalize() - entry_date.normalize()).days
+
+                    row = dict(setup)
+                    row.update({
+                        "현재상태": "D진입 발생",
+                        "예상진입일": e["진입일"],
+                        "예상진입가": round(float(e["진입가"]), 2),
+                        "진입경과일": age_days,
+                    })
+
+                    tmp = pd.DataFrame([row])
+                    passed = not j4_apply_rule(tmp).empty
+                    row["J4필터통과"] = passed
+
+                    if passed and age_days <= 2:
+                        rows.append(row)
+                    continue
+
+                # No D entry yet. Check whether still within 5-day waiting window after breakout.
+                br_i = int(setup["_breakout_i"])
+                last_i = len(prepared) - 1
+                elapsed = last_i - br_i
+
+                if elapsed < 1 or elapsed > 5:
+                    continue
+
+                last = prepared.iloc[-1]
+                ma5 = float(last["MA5"]) if pd.notna(last["MA5"]) else None
+
+                if ma5 is None or ma5 <= 0:
+                    continue
+
+                row = dict(setup)
+                row.update({
+                    "현재상태": "5일선 눌림 대기",
+                    "예상진입일": None,
+                    "예상진입가": round(ma5, 2),
+                    "진입경과일": elapsed,
+                })
+
+                tmp = pd.DataFrame([{
+                    **row,
+                    "진입5일선이격(%)": row.get("진입5일선이격(%)", None)
+                }])
+
+                # For waiting names, J4 MA5-gap should be evaluated at eventual entry.
+                # Therefore only pre-screen prior60 now; final check happens at touch.
+                p60 = pd.to_numeric(
+                    pd.Series([row.get("전고점60이격(%)")]),
+                    errors="coerce"
+                ).iloc[0]
+
+                row["J4필터통과"] = (
+                    pd.notna(p60)
+                    and p60 <= J4_PRIOR60_MAX
+                )
+
+                if row["J4필터통과"]:
+                    rows.append(row)
 
             except Exception as e:
                 errors.append(
-                    f"{market} {name}({code}): "
-                    f"{type(e).__name__}"
+                    f"{market} {name}({code}): {type(e).__name__}"
                 )
 
-            progress.progress(
-                done / max(total, 1)
-            )
+    return pd.DataFrame(rows), errors
 
-            time.sleep(0.003)
 
-    if not setups:
-        progress.empty()
-        st.warning("J1 구조 신호가 없습니다.")
-        st.stop()
+def j6_priority_score(df):
+    """
+    3종목 제한 시 우선순위.
+    새 전략 최적화가 아니라 기존 J4 논리를 운영 규칙으로 단순 정렬:
+      1) 전고점60 이격이 낮을수록 우선
+      2) 5일선 이격이 낮을수록 우선
+      3) 구조거래량 수축이 낮을수록 우선
+      4) 기준봉 거래대금이 클수록 우선
+    """
+    q = df.copy()
 
-    setup_df = (
-        pd.DataFrame(setups)
-        .sort_values(
-            ["돌파일", "코드"]
-        )
-        .drop_duplicates(
-            ["코드", "돌파일"]
-        )
-        .reset_index(drop=True)
+    for c in [
+        "전고점60이격(%)",
+        "진입5일선이격(%)",
+        "구조거래량수축",
+        "기준봉거래대금(억)"
+    ]:
+        q[c] = pd.to_numeric(q.get(c), errors="coerce")
+
+    # Rank-based score avoids inventing new hard thresholds.
+    q["_r1"] = q["전고점60이격(%)"].rank(
+        method="min",
+        ascending=True,
+        na_option="bottom"
+    )
+    q["_r2"] = q["진입5일선이격(%)"].rank(
+        method="min",
+        ascending=True,
+        na_option="bottom"
+    )
+    q["_r3"] = q["구조거래량수축"].rank(
+        method="min",
+        ascending=True,
+        na_option="bottom"
+    )
+    q["_r4"] = q["기준봉거래대금(억)"].rank(
+        method="min",
+        ascending=False,
+        na_option="bottom"
     )
 
-    setup_df["신호ID"] = [
-        f"S{i+1:05d}"
-        for i in range(len(setup_df))
-    ]
-
-    rows = []
-
-    for pos, (_, setup) in enumerate(
-        setup_df.iterrows(),
-        1
-    ):
-        d = data_map.get(
-            (
-                setup["시장"],
-                str(setup["코드"]).zfill(6)
-            )
-        )
-
-        if d is None:
-            continue
-
-        entries = [
-            e for e in j2_make_entries(
-                d,
-                setup,
-                int(wait_days)
-            )
-            if e["진입전략"]
-            == "D 5일선 눌림"
-        ]
-
-        for entry in entries:
-            ev = j2_evaluate_trade(
-                d,
-                setup,
-                entry
-            )
-
-            if ev is None:
-                continue
-
-            row = setup.drop(
-                labels=[
-                    "_b",
-                    "_breakout_i"
-                ],
-                errors="ignore"
-            ).to_dict()
-
-            row.update({
-                k: v
-                for k, v in entry.items()
-                if not k.startswith("_")
-            })
-
-            row.update(ev)
-            rows.append(row)
-
-        if pos % 25 == 0:
-            status.info(
-                f"D 진입 평가 "
-                f"{pos}/{len(setup_df)}"
-            )
-
-    progress.empty()
-
-    trades = pd.DataFrame(rows)
-
-    if trades.empty:
-        st.warning(
-            "D=5일선 눌림 체결이 없습니다."
-        )
-        st.stop()
-
-    selected = j4_apply_rule(
-        trades
+    q["운용우선순위점수"] = (
+        q["_r1"] * 0.40
+        + q["_r2"] * 0.30
+        + q["_r3"] * 0.20
+        + q["_r4"] * 0.10
     )
 
-    if selected.empty:
-        st.warning(
-            "J4 고정필터 통과 거래가 없습니다."
-        )
-        st.stop()
-
-    status.success(
-        f"완료 · D 체결 {len(trades)}건 · "
-        f"J4 고정필터 {len(selected)}건"
-    )
-
-    summary, ledgers, curves, yearly = (
-        j51_compare_scenarios(
-            selected,
-            data_map,
-            int(initial_cash)
-        )
-    )
-
-    st.subheader(
-        "① 일별 평가 계좌 성과"
-    )
-
-    st.dataframe(
-        summary,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.subheader(
-        "② J5.1 핵심 위험도 비교"
-    )
-
-    risk_cols = [
-        "시장",
-        "최대동시보유설정",
-        "최종자산",
-        "CAGR(%)",
-        "승률(%)",
-        "일별계좌MDD(%)",
-        "실제체결",
-        "미체결신호",
-        "신호체결률(%)",
-        "평균현금비중(%)",
-    ]
-
-    st.dataframe(
-        summary[
-            [
-                c for c in risk_cols
-                if c in summary.columns
-            ]
+    q = q.sort_values(
+        [
+            "운용우선순위점수",
+            "돌파일"
         ],
-        use_container_width=True,
-        hide_index=True
+        ascending=[
+            True,
+            False
+        ]
+    ).reset_index(drop=True)
+
+    q["우선순위"] = range(1, len(q) + 1)
+
+    return q.drop(
+        columns=["_r1","_r2","_r3","_r4"],
+        errors="ignore"
     )
 
-    st.subheader(
-        "③ 연도별 실제 계좌수익/MDD"
-    )
 
-    for key in [
-        "전체_3종목",
-        "전체_5종목",
-        "KOSPI_3종목",
-        "KOSPI_5종목",
-        "KOSDAQ_3종목",
-        "KOSDAQ_5종목",
-    ]:
-        with st.expander(key):
-            st.dataframe(
-                yearly.get(
-                    key,
-                    pd.DataFrame()
-                ),
-                use_container_width=True,
-                hide_index=True
-            )
+def j6_position_management(entry_price, current_price, highest_price):
+    """
+    J4/J5.1과 동일한 청산 규칙을 실전용 숫자로 표시.
+    """
+    entry_price = float(entry_price)
+    current_price = float(current_price)
+    highest_price = float(highest_price)
 
-    st.subheader(
-        "④ 일별 Equity Curve 원자료"
-    )
+    initial_stop = entry_price * 0.97
+    activated = highest_price >= entry_price * 1.02
 
-    for key in [
-        "전체_3종목",
-        "전체_5종목",
-        "KOSPI_3종목",
-        "KOSPI_5종목",
-        "KOSDAQ_3종목",
-        "KOSDAQ_5종목",
-    ]:
-        with st.expander(key):
-            st.dataframe(
-                curves.get(
-                    key,
-                    pd.DataFrame()
-                ),
-                use_container_width=True,
-                hide_index=True
-            )
-
-    st.subheader(
-        "⑤ 모의매매 전 판정"
-    )
-
-    candidates = summary[
-        (summary["실제체결"] >= 50)
-        & (summary["승률(%)"] >= 50)
-        & (summary["CAGR(%)"] > 0)
-        & (summary["일별계좌MDD(%)"] >= -15)
-    ].copy()
-
-    if candidates.empty:
-        st.warning(
-            "일별 MDD -15% 이내 + 승률 50% 이상을 "
-            "동시에 만족한 운용안이 없습니다. "
-            "모의매매 전 위험도 재검토가 필요합니다."
-        )
+    if activated:
+        trailing = highest_price * 0.98
+        active_stop = max(entry_price, trailing)
+        state = "트레일 활성"
     else:
-        candidates = candidates.sort_values(
-            [
-                "승률(%)",
-                "일별계좌MDD(%)",
-                "CAGR(%)"
-            ],
-            ascending=[
-                False,
-                False,
-                False
-            ]
-        )
+        active_stop = initial_stop
+        state = "초기 손절 구간"
 
-        best = candidates.iloc[0]
-
-        st.success(
-            f'✅ 모의매매 후보: '
-            f'**{best["시장"]} / '
-            f'{int(best["최대동시보유설정"])}종목** · '
-            f'승률 {best["승률(%)"]:.1f}% · '
-            f'CAGR {best["CAGR(%)"]:.1f}% · '
-            f'일별 MDD {best["일별계좌MDD(%)"]:.1f}%'
-        )
-
-    st.subheader(
-        "⑥ J5.1 전체 Excel"
-    )
-
-    settings = pd.DataFrame([
-        {
-            "항목": "전략",
-            "값": (
-                "D 첫 5일선 눌림 + "
-                + J4_RULE_TEXT
-            )
-        },
-        {
-            "항목": "초기자금",
-            "값": int(initial_cash)
-        },
-        {
-            "항목": "비교 동시보유",
-            "값": "3종목 / 5종목"
-        },
-        {
-            "항목": "계좌평가",
-            "값": "보유종목 매 거래일 종가 Mark-to-Market"
-        },
-        {
-            "항목": "시장비교",
-            "값": "전체 / KOSPI / KOSDAQ"
-        },
-        {
-            "항목": "비용",
-            "값": "기존 거래비용 0.40% 포함"
-        },
-        {
-            "항목": "모의매매 후보 기준",
-            "값": "체결>=50 / 승률>=50% / CAGR>0 / 일별MDD>=-15%"
-        },
-        {
-            "항목": "원칙",
-            "값": "전략조건 재최적화 없음"
-        },
-    ])
-
-    sheets = {
-        "00_설정": settings,
-        "01_계좌비교": summary,
-        "02_J4고정필터거래": selected,
+    return {
+        "상태": state,
+        "초기손절가": round(initial_stop, 2),
+        "활성기준가(+2%)": round(entry_price * 1.02, 2),
+        "현재유효손절가": round(active_stop, 2),
+        "현재수익률(%)": round(
+            (current_price / entry_price - 1) * 100,
+            2
+        ),
+        "고점대비하락률(%)": round(
+            (current_price / highest_price - 1) * 100,
+            2
+        ) if highest_price > 0 else None,
     }
 
-    for key in [
-        "전체_3종목",
-        "전체_5종목",
-        "KOSPI_3종목",
-        "KOSPI_5종목",
-        "KOSDAQ_3종목",
-        "KOSDAQ_5종목",
-    ]:
-        sheets[
-            f"{key}_체결"
-        ] = ledgers.get(
-            key,
-            pd.DataFrame()
-        )
 
-        sheets[
-            f"{key}_연도"
-        ] = yearly.get(
-            key,
-            pd.DataFrame()
-        )
-
-        sheets[
-            f"{key}_일별"
-        ] = curves.get(
-            key,
-            pd.DataFrame()
-        )
-
-    excel_bytes = build_excel(
-        sheets
+def j6_order_plan(candidates, paper_cash, existing_positions):
+    """
+    최대 3종목 동일비중.
+    기존 보유 종목 수를 제외한 남은 슬롯에 현금을 균등 배분.
+    """
+    slots = max(
+        0,
+        J6_MAX_POSITIONS - int(existing_positions)
     )
 
-    st.download_button(
-        "📦 J5.1 일별 MDD 검증 Excel 다운로드",
-        data=excel_bytes,
-        file_name=(
-            "swing_J5_1_daily_mark_to_market_validation.xlsx"
-        ),
-        mime=(
-            "application/"
-            "vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
+    q = candidates.copy()
+
+    if q.empty or slots <= 0:
+        q["모의매매선정"] = False
+        q["배정금액"] = 0
+        return q, slots
+
+    q = j6_priority_score(q)
+
+    q["모의매매선정"] = (
+        q["우선순위"] <= slots
+    )
+
+    allocation = (
+        float(paper_cash) / slots
+        if slots > 0
+        else 0
+    )
+
+    q["배정금액"] = q["모의매매선정"].map(
+        lambda x: round(allocation) if x else 0
+    )
+
+    return q, slots
+
+
+# ============================================================
+# UI
+# ============================================================
+
+st.set_page_config(
+    page_title="J6 v1.0 모의매매 운영판",
+    layout="wide"
+)
+
+st.title(
+    "🟢 J6 v1.0 · 모의매매 실전 운영판"
+)
+
+st.caption(
+    "J4 전략 고정 · J5.1 3종목 운용 · "
+    "신규 후보 / 주문 우선순위 / 보유종목 청산관리"
+)
+
+with st.sidebar:
+    st.header("J6 운용 설정")
+
+    asof_date = st.date_input(
+        "기준일",
+        date.today()
+    )
+
+    per_market = st.selectbox(
+        "시장별 검색 종목 수",
+        [300,500,700],
+        index=1
+    )
+
+    paper_cash = st.number_input(
+        "모의계좌 가용현금(원)",
+        min_value=0,
+        max_value=1_000_000_000,
+        value=10_000_000,
+        step=100_000
+    )
+
+    existing_positions = st.number_input(
+        "현재 보유종목 수",
+        min_value=0,
+        max_value=3,
+        value=0,
+        step=1
+    )
+
+    run = st.button(
+        "▶ 오늘 후보 검색",
+        type="primary",
         use_container_width=True
     )
 
+st.info(
+    f"고정 규칙: J1 구조 → D 첫 5일선 눌림 → {J4_RULE_TEXT}. "
+    "최대 동시보유는 3종목으로 고정합니다. "
+    "신규 후보가 3개를 넘으면 새로운 컷을 만들지 않고 기존 J4 구조변수의 순위만 사용합니다."
+)
+
+st.subheader("① 모의매매 운영 규칙")
+
+rules_df = pd.DataFrame([
+    {
+        "단계":"종목선정",
+        "운영규칙":"J1 자금유입→눌림/횡보→관문 재돌파 구조"
+    },
+    {
+        "단계":"진입",
+        "운영규칙":"재돌파 후 최대 5거래일 내 첫 5일선 터치"
+    },
+    {
+        "단계":"최종필터",
+        "운영규칙":J4_RULE_TEXT
+    },
+    {
+        "단계":"초기손절",
+        "운영규칙":"진입가 대비 -3%"
+    },
+    {
+        "단계":"트레일 활성",
+        "운영규칙":"진입 후 +2% 이상 도달"
+    },
+    {
+        "단계":"트레일",
+        "운영규칙":"활성 후 최고가 대비 -2%, 단 진입가 이하로 내리지 않음"
+    },
+    {
+        "단계":"기간청산",
+        "운영규칙":"진입 다음날부터 최대 5거래일"
+    },
+    {
+        "단계":"동시보유",
+        "운영규칙":"최대 3종목"
+    },
+])
+
+st.dataframe(
+    rules_df,
+    use_container_width=True,
+    hide_index=True
+)
+
+if run:
+    try:
+        listing = stock_listing()
+    except Exception as e:
+        st.error(
+            f"종목 목록 조회 실패: {type(e).__name__}"
+        )
+        st.exception(e)
+        st.stop()
+
+    with st.spinner(
+        "현재 조건에 맞는 후보를 검색 중입니다..."
+    ):
+        candidates, errors = j6_find_latest_candidates(
+            listing,
+            int(per_market),
+            pd.Timestamp(asof_date)
+        )
+
+    if candidates.empty:
+        st.warning(
+            "현재 기준일에는 J6 조건을 만족하는 신규 후보가 없습니다."
+        )
+    else:
+        candidates = candidates[
+            candidates["J4필터통과"] == True
+        ].copy()
+
+        plan, slots = j6_order_plan(
+            candidates,
+            int(paper_cash),
+            int(existing_positions)
+        )
+
+        st.subheader("② 오늘 신규 후보")
+
+        show_cols = [
+            "우선순위",
+            "시장",
+            "종목명",
+            "코드",
+            "현재상태",
+            "돌파일",
+            "예상진입일",
+            "예상진입가",
+            "진입경과일",
+            "전고점60이격(%)",
+            "진입5일선이격(%)",
+            "구조거래량수축",
+            "기준봉거래대금(억)",
+            "모의매매선정",
+            "배정금액",
+        ]
+
+        st.dataframe(
+            plan[
+                [
+                    c for c in show_cols
+                    if c in plan.columns
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        selected_today = plan[
+            plan["모의매매선정"] == True
+        ].copy()
+
+        st.subheader("③ 오늘 주문 계획")
+
+        if selected_today.empty:
+            st.info(
+                "현재 보유 종목 수 때문에 신규 진입 슬롯이 없습니다."
+            )
+        else:
+            order_cols = [
+                "우선순위",
+                "시장",
+                "종목명",
+                "코드",
+                "현재상태",
+                "예상진입가",
+                "배정금액",
+            ]
+
+            st.dataframe(
+                selected_today[
+                    [
+                        c for c in order_cols
+                        if c in selected_today.columns
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.caption(
+                "실제 체결은 예상진입가 부근에서 5일선 첫 터치가 확인될 때만 모의체결합니다. "
+                "대기 상태인 종목을 미리 매수하지 않습니다."
+            )
+
+        st.subheader("④ 후보 전체 Excel")
+
+        settings = pd.DataFrame([
+            {
+                "항목":"전략",
+                "값":(
+                    "J1 구조 + D 5일선 눌림 + "
+                    + J4_RULE_TEXT
+                )
+            },
+            {
+                "항목":"최대동시보유",
+                "값":J6_MAX_POSITIONS
+            },
+            {
+                "항목":"가용현금",
+                "값":int(paper_cash)
+            },
+            {
+                "항목":"현재보유",
+                "값":int(existing_positions)
+            },
+            {
+                "항목":"남은슬롯",
+                "값":int(slots)
+            },
+            {
+                "항목":"우선순위",
+                "값":"전고점60 이격 → 5일선 이격 → 구조거래량수축 → 기준봉 거래대금"
+            },
+            {
+                "항목":"중요",
+                "값":"운영 우선순위일 뿐 전략 필터 추가가 아님"
+            },
+        ])
+
+        excel_bytes = build_excel({
+            "00_운영설정":settings,
+            "01_오늘후보":plan,
+            "02_오늘선정":selected_today,
+        })
+
+        st.download_button(
+            "📦 J6 오늘 후보 Excel 다운로드",
+            data=excel_bytes,
+            file_name=(
+                f"J6_paper_candidates_"
+                f"{pd.Timestamp(asof_date).strftime('%Y%m%d')}.xlsx"
+            ),
+            mime=(
+                "application/"
+                "vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            use_container_width=True
+        )
+
     if errors:
         with st.expander(
-            f"조회 실패/데이터 부족 "
-            f"{len(errors)}건"
+            f"조회 실패/데이터 부족 {len(errors)}건"
         ):
             st.write(errors)
 
+st.subheader("⑤ 보유종목 청산 계산기")
+
 st.caption(
-    "J5.1 · 전략은 J4 그대로 고정. "
-    "보유 중 가격변동을 일별 종가로 계좌에 반영해 "
-    "실제 위험도와 MDD를 확인합니다."
+    "모의매매 후 보유 종목의 진입가·현재가·진입 후 최고가를 입력하면 "
+    "현재 유효 손절/트레일 가격을 계산합니다."
+)
+
+c1,c2,c3 = st.columns(3)
+
+with c1:
+    calc_entry = st.number_input(
+        "진입가",
+        min_value=0.0,
+        value=0.0,
+        step=100.0
+    )
+
+with c2:
+    calc_current = st.number_input(
+        "현재가",
+        min_value=0.0,
+        value=0.0,
+        step=100.0
+    )
+
+with c3:
+    calc_high = st.number_input(
+        "진입 후 최고가",
+        min_value=0.0,
+        value=0.0,
+        step=100.0
+    )
+
+if (
+    calc_entry > 0
+    and calc_current > 0
+    and calc_high > 0
+):
+    mgmt = j6_position_management(
+        calc_entry,
+        calc_current,
+        calc_high
+    )
+
+    st.dataframe(
+        pd.DataFrame([mgmt]),
+        use_container_width=True,
+        hide_index=True
+    )
+
+st.caption(
+    "J6 v1.0은 모의매매 운영판입니다. "
+    "실제 주문을 자동 전송하지 않으며, "
+    "전략 조건은 J4/J5.1에서 검증된 값을 그대로 사용합니다."
 )
