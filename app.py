@@ -5,9 +5,9 @@ import time
 from datetime import date
 from io import BytesIO
 
-st.set_page_config(page_title="단기스윙 v13.1 종가베팅 비교 수정판", layout="wide")
-st.title("📌 단기스윙 v13.1 · 진입방식/종가베팅 비교 수정판")
-st.caption("F1+F2 신호 고정 · 현재 돌파진입 vs 돌파일 종가베팅 vs 종가강도 확인형 종가베팅 · 승률 최우선 비교")
+st.set_page_config(page_title="단기스윙 v14.1 C전략 구제필터 비교", layout="wide")
+st.title("🧭 단기스윙 v14.1 · C전략 구제필터 비교")
+st.caption("C 종가강도 전략 고정 · v14 1차필터 + 승률형/세력형/복합형 구제조건 비교 · 승률 최우선")
 
 # ============================================================
 # 완전 동결된 전략값
@@ -2335,504 +2335,451 @@ def v13_time_split(df, ratio=0.60):
 
     return pd.DataFrame(rows)
 
+
+# ============================================================
+# v14.1 filters
+# ============================================================
+def v141_base_filter(df):
+    vol = pd.to_numeric(df["돌파거래량배수20"], errors="coerce")
+    ma5 = pd.to_numeric(df["진입5일선이격(%)"], errors="coerce")
+    return (vol <= 6.0) & (ma5 >= 12.0)
+
+def v141_filter_a(df):
+    ma5 = pd.to_numeric(df["진입5일선이격(%)"], errors="coerce")
+    return v141_base_filter(df) | (ma5 <= 7.0)
+
+def v141_filter_b(df):
+    value = pd.to_numeric(df["기준봉거래대금(억)"], errors="coerce")
+    return v141_base_filter(df) | (value >= 6000.0)
+
+def v141_filter_ab(df):
+    ma5 = pd.to_numeric(df["진입5일선이격(%)"], errors="coerce")
+    value = pd.to_numeric(df["기준봉거래대금(억)"], errors="coerce")
+    return v141_base_filter(df) | (ma5 <= 7.0) | (value >= 6000.0)
+
+def v141_stats(df):
+    s = performance_stats(df)
+    s["손절률(%)"] = 0.0 if df.empty else round(
+        df["청산사유"].astype(str).str.startswith("손절").mean() * 100, 1
+    )
+    return s
+
+def v141_apply(df, name):
+    if name == "C 원본":
+        return df.copy()
+    if name == "v14 1차":
+        return df[v141_base_filter(df).fillna(False)].copy()
+    if name == "A 승률형":
+        return df[v141_filter_a(df).fillna(False)].copy()
+    if name == "B 세력형":
+        return df[v141_filter_b(df).fillna(False)].copy()
+    if name == "A+B 복합형":
+        return df[v141_filter_ab(df).fillna(False)].copy()
+    return pd.DataFrame()
+
+def v141_compare(df):
+    rows = []
+    for name in ["C 원본","v14 1차","A 승률형","B 세력형","A+B 복합형"]:
+        rows.append({"전략":name, **v141_stats(v141_apply(df,name))})
+    out = pd.DataFrame(rows).sort_values(
+        ["승률(%)","신호","평균수익률(%)","ProfitFactor","손절률(%)"],
+        ascending=[False,False,False,False,True]
+    ).reset_index(drop=True)
+    out.insert(0,"순위",range(1,len(out)+1))
+    return out
+
+def v141_time_split(df):
+    rows=[]
+    for name in ["C 원본","v14 1차","A 승률형","B 세력형","A+B 복합형"]:
+        q=v141_apply(df,name).sort_values("진입일").reset_index(drop=True)
+        if q.empty:
+            continue
+        n=len(q)
+        cut=max(1,min(n-1,int(n*0.60))) if n>1 else 1
+        for label,g in [("앞60%",q.iloc[:cut]),("뒤40%",q.iloc[cut:])]:
+            if not g.empty:
+                rows.append({"전략":name,"구간":label,**v141_stats(g)})
+    return pd.DataFrame(rows)
+
+def v141_yearly(df):
+    rows=[]
+    for name in ["C 원본","v14 1차","A 승률형","B 세력형","A+B 복합형"]:
+        q=v141_apply(df,name).copy()
+        if q.empty:
+            continue
+        q["연도"]=pd.to_datetime(q["진입일"]).dt.year
+        for y,g in q.groupby("연도"):
+            rows.append({"전략":name,"연도":int(y),**v141_stats(g)})
+    return pd.DataFrame(rows)
+
+def v141_rescue_audit(df):
+    base=v141_apply(df,"v14 1차")
+    base_keys=set(zip(base["코드"].astype(str),base["돌파일"].astype(str)))
+    rows=[]
+    for name in ["A 승률형","B 세력형","A+B 복합형"]:
+        q=v141_apply(df,name)
+        extra=q[~q.apply(lambda r:(str(r["코드"]),str(r["돌파일"])) in base_keys,axis=1)].copy()
+        s=v141_stats(extra)
+        rows.append({
+            "구제유형":name,
+            "추가구제건수":len(extra),
+            "추가구제승리":int((extra["순수익률(%)"]>0).sum()) if len(extra) else 0,
+            "추가구제손실":int((extra["순수익률(%)"]<=0).sum()) if len(extra) else 0,
+            "추가구제승률(%)":s["승률(%)"],
+            "추가구제평균(%)":s["평균수익률(%)"],
+            "추가구제PF":s["ProfitFactor"],
+        })
+    return pd.DataFrame(rows)
+
+def v141_removed_analysis(df):
+    removed=df[~v141_base_filter(df).fillna(False)].copy()
+    if removed.empty:
+        return removed,pd.DataFrame()
+    removed["결과그룹"]=removed["순수익률(%)"].apply(lambda x:"제거승리" if x>0 else "제거손실")
+    feats=[
+        "기준봉거래대금(억)","돌파거래량배수20","진입5일선이격(%)",
+        "돌파종가수익률(%)","전고점20이격(%)","전고점60이격(%)",
+        "눌림깊이(%)","돌파봉종가위치(%)"
+    ]
+    rows=[]
+    for f in feats:
+        if f not in removed.columns:
+            continue
+        w=pd.to_numeric(removed.loc[removed["결과그룹"]=="제거승리",f],errors="coerce").dropna()
+        l=pd.to_numeric(removed.loc[removed["결과그룹"]=="제거손실",f],errors="coerce").dropna()
+        rows.append({
+            "변수":f,
+            "제거승리평균":round(w.mean(),2) if len(w) else None,
+            "제거손실평균":round(l.mean(),2) if len(l) else None,
+            "차이":round(w.mean()-l.mean(),2) if len(w) and len(l) else None,
+        })
+    return removed,pd.DataFrame(rows)
+
+# ============================================================
+# v14.1 filters
+# ============================================================
+def v141_base_filter(df):
+    vol = pd.to_numeric(df["돌파거래량배수20"], errors="coerce")
+    ma5 = pd.to_numeric(df["진입5일선이격(%)"], errors="coerce")
+    return (vol <= 6.0) & (ma5 >= 12.0)
+
+def v141_filter_a(df):
+    ma5 = pd.to_numeric(df["진입5일선이격(%)"], errors="coerce")
+    return v141_base_filter(df) | (ma5 <= 7.0)
+
+def v141_filter_b(df):
+    value = pd.to_numeric(df["기준봉거래대금(억)"], errors="coerce")
+    return v141_base_filter(df) | (value >= 6000.0)
+
+def v141_filter_ab(df):
+    ma5 = pd.to_numeric(df["진입5일선이격(%)"], errors="coerce")
+    value = pd.to_numeric(df["기준봉거래대금(억)"], errors="coerce")
+    return v141_base_filter(df) | (ma5 <= 7.0) | (value >= 6000.0)
+
+def v141_stats(df):
+    s = performance_stats(df)
+    s["손절률(%)"] = 0.0 if df.empty else round(
+        df["청산사유"].astype(str).str.startswith("손절").mean() * 100, 1
+    )
+    return s
+
+def v141_apply(df, name):
+    if name == "C 원본":
+        return df.copy()
+    if name == "v14 1차":
+        return df[v141_base_filter(df).fillna(False)].copy()
+    if name == "A 승률형":
+        return df[v141_filter_a(df).fillna(False)].copy()
+    if name == "B 세력형":
+        return df[v141_filter_b(df).fillna(False)].copy()
+    if name == "A+B 복합형":
+        return df[v141_filter_ab(df).fillna(False)].copy()
+    return pd.DataFrame()
+
+def v141_compare(df):
+    rows = []
+    for name in ["C 원본","v14 1차","A 승률형","B 세력형","A+B 복합형"]:
+        rows.append({"전략":name, **v141_stats(v141_apply(df,name))})
+    out = pd.DataFrame(rows).sort_values(
+        ["승률(%)","신호","평균수익률(%)","ProfitFactor","손절률(%)"],
+        ascending=[False,False,False,False,True]
+    ).reset_index(drop=True)
+    out.insert(0,"순위",range(1,len(out)+1))
+    return out
+
+def v141_time_split(df):
+    rows=[]
+    for name in ["C 원본","v14 1차","A 승률형","B 세력형","A+B 복합형"]:
+        q=v141_apply(df,name).sort_values("진입일").reset_index(drop=True)
+        if q.empty:
+            continue
+        n=len(q)
+        cut=max(1,min(n-1,int(n*0.60))) if n>1 else 1
+        for label,g in [("앞60%",q.iloc[:cut]),("뒤40%",q.iloc[cut:])]:
+            if not g.empty:
+                rows.append({"전략":name,"구간":label,**v141_stats(g)})
+    return pd.DataFrame(rows)
+
+def v141_yearly(df):
+    rows=[]
+    for name in ["C 원본","v14 1차","A 승률형","B 세력형","A+B 복합형"]:
+        q=v141_apply(df,name).copy()
+        if q.empty:
+            continue
+        q["연도"]=pd.to_datetime(q["진입일"]).dt.year
+        for y,g in q.groupby("연도"):
+            rows.append({"전략":name,"연도":int(y),**v141_stats(g)})
+    return pd.DataFrame(rows)
+
+def v141_rescue_audit(df):
+    base=v141_apply(df,"v14 1차")
+    base_keys=set(zip(base["코드"].astype(str),base["돌파일"].astype(str)))
+    rows=[]
+    for name in ["A 승률형","B 세력형","A+B 복합형"]:
+        q=v141_apply(df,name)
+        extra=q[~q.apply(lambda r:(str(r["코드"]),str(r["돌파일"])) in base_keys,axis=1)].copy()
+        s=v141_stats(extra)
+        rows.append({
+            "구제유형":name,
+            "추가구제건수":len(extra),
+            "추가구제승리":int((extra["순수익률(%)"]>0).sum()) if len(extra) else 0,
+            "추가구제손실":int((extra["순수익률(%)"]<=0).sum()) if len(extra) else 0,
+            "추가구제승률(%)":s["승률(%)"],
+            "추가구제평균(%)":s["평균수익률(%)"],
+            "추가구제PF":s["ProfitFactor"],
+        })
+    return pd.DataFrame(rows)
+
+def v141_removed_analysis(df):
+    removed=df[~v141_base_filter(df).fillna(False)].copy()
+    if removed.empty:
+        return removed,pd.DataFrame()
+    removed["결과그룹"]=removed["순수익률(%)"].apply(lambda x:"제거승리" if x>0 else "제거손실")
+    feats=[
+        "기준봉거래대금(억)","돌파거래량배수20","진입5일선이격(%)",
+        "돌파종가수익률(%)","전고점20이격(%)","전고점60이격(%)",
+        "눌림깊이(%)","돌파봉종가위치(%)"
+    ]
+    rows=[]
+    for f in feats:
+        if f not in removed.columns:
+            continue
+        w=pd.to_numeric(removed.loc[removed["결과그룹"]=="제거승리",f],errors="coerce").dropna()
+        l=pd.to_numeric(removed.loc[removed["결과그룹"]=="제거손실",f],errors="coerce").dropna()
+        rows.append({
+            "변수":f,
+            "제거승리평균":round(w.mean(),2) if len(w) else None,
+            "제거손실평균":round(l.mean(),2) if len(l) else None,
+            "차이":round(w.mean()-l.mean(),2) if len(w) and len(l) else None,
+        })
+    return removed,pd.DataFrame(rows)
+
 # ============================================================
 # UI
 # ============================================================
 with st.sidebar:
-    st.header("v13.1 비교 설정")
-
-    end_date = st.date_input(
-        "종료일",
-        date(2026,7,31)
-    )
-
-    years = st.selectbox(
-        "검증 기간",
-        [3,4,5],
-        index=2,
-        format_func=lambda x:f"{x}년"
-    )
-
-    universe_n = st.selectbox(
-        "KOSPI 검증 종목 수",
-        [300,500,700],
-        index=1
-    )
-
-    run = st.button(
-        "▶ v13.1 진입방식 재검증",
-        type="primary",
-        use_container_width=True
-    )
+    st.header("v14.1 비교 설정")
+    end_date = st.date_input("종료일", date(2026,7,31))
+    years = st.selectbox("검증 기간",[3,4,5],index=2,format_func=lambda x:f"{x}년")
+    universe_n = st.selectbox("KOSPI 검증 종목 수",[300,500,700],index=1)
+    run = st.button("▶ v14.1 구제필터 비교",type="primary",use_container_width=True)
 
 st.info(
-    "v13.1 수정판: F1+F2 종목선정과 A/B/C 진입조건은 그대로 유지합니다. "
-    "B/C 종가진입은 진입 당일 High/Low를 절대 청산판정에 사용하지 않고 다음 거래일부터 평가합니다. "
-    "A 돌파진입도 당일 Low의 선후관계를 알 수 없으므로 사용하지 않으며, 당일 종가가 -3% 손절선 이하인 확정 손절만 반영합니다. "
-    "이후 모든 전략은 -3% 손절 / +2% 활성 / 2% 트레일 / 진입 후 5거래일 / 비용 0.40%로 동일하게 비교합니다."
+    "v14.1은 v13.1의 C 종가강도 전략만 사용합니다. "
+    "C 원본, v14 1차, A 승률형(5일선이격≤7% 구제), "
+    "B 세력형(기준봉거래대금≥6000억 구제), A+B 복합형을 같은 표본에서 비교합니다."
 )
 
 if run:
-    end_ts = pd.Timestamp(end_date)
-    cut = end_ts - pd.DateOffset(years=int(years))
-    start_ts = cut - pd.Timedelta(days=120)
-    fetch_end = end_ts + pd.Timedelta(days=45)
+    end_ts=pd.Timestamp(end_date)
+    cut=end_ts-pd.DateOffset(years=int(years))
+    start_ts=cut-pd.Timedelta(days=120)
+    fetch_end=end_ts+pd.Timedelta(days=45)
 
     try:
-        listing = stock_listing()
+        listing=stock_listing()
     except Exception as e:
         st.error(f"종목 목록 조회 실패: {type(e).__name__}")
-        st.exception(e)
-        st.stop()
+        st.exception(e); st.stop()
 
-    # KOSPI 내 넓은 표본. v13은 진입방식 비교가 목적이라
-    # 세 전략이 동일한 F1+F2 신호를 공유한다.
-    universe = (
-        listing[listing["Market"] == "KOSPI"]
-        .sort_values("Code")
-        .head(int(universe_n))
-        .copy()
-        .reset_index(drop=True)
+    universe=(
+        listing[listing["Market"]=="KOSPI"]
+        .sort_values("Code").head(int(universe_n))
+        .copy().reset_index(drop=True)
     )
 
-    progress = st.progress(0)
-    status = st.empty()
+    progress=st.progress(0); status=st.empty()
+    setups=[]; data_map={}; errors=[]; total=len(universe)
 
-    setups = []
-    data_map = {}
-    errors = []
-    total = len(universe)
-
-    for pos, (_, r) in enumerate(universe.iterrows(),1):
-        code0 = str(r["Code"]).zfill(6)
-        name = r["Name"]
-
-        status.info(
-            f"1/2 데이터/신호 {pos}/{total} · {name}"
-        )
-
+    for pos,(_,r) in enumerate(universe.iterrows(),1):
+        code0=str(r["Code"]).zfill(6); name=r["Name"]
+        status.info(f"1/2 데이터/신호 {pos}/{total} · {name}")
         try:
-            d = load_data(
-                code0,
-                start_ts.strftime("%Y-%m-%d"),
-                fetch_end.strftime("%Y-%m-%d")
-            )
-
-            if d is None or d.empty or len(d) < 100:
+            d=load_data(code0,start_ts.strftime("%Y-%m-%d"),fetch_end.strftime("%Y-%m-%d"))
+            if d is None or d.empty or len(d)<100:
                 continue
-
-            found, prepared = find_setups(
-                d,
-                code0,
-                name,
-                "KOSPI",
-                cut,
-                end_ts
-            )
-
-            data_map[code0] = prepared
-
+            found,prepared=find_setups(d,code0,name,"KOSPI",cut,end_ts)
+            data_map[code0]=prepared
             if found:
                 setups.extend(found)
-
         except Exception as e:
-            errors.append(
-                f"{name}({code0}): {type(e).__name__}"
-            )
-
+            errors.append(f"{name}({code0}): {type(e).__name__}")
         progress.progress(pos/(total*2))
         time.sleep(0.005)
 
     if not setups:
-        progress.empty()
-        status.warning("setup이 없습니다.")
-        st.stop()
+        progress.empty(); status.warning("setup이 없습니다."); st.stop()
 
-    setup_df = dedup_setups(
-        pd.DataFrame(setups)
-    )
+    setup_df=dedup_setups(pd.DataFrame(setups))
+    selected=setup_df[setup_df.apply(frozen_filter,axis=1)].reset_index(drop=True)
 
-    selected = setup_df[
-        setup_df.apply(
-            frozen_filter,
-            axis=1
-        )
-    ].reset_index(drop=True)
-
-    rows = []
-
-    combo_total = len(selected) * len(V13_ENTRY_MODES)
-    done = 0
-
-    for _, setup in selected.iterrows():
-        code0 = str(setup["코드"]).zfill(6)
-        d = data_map.get(code0)
-
+    rows=[]
+    for idx,(_,setup) in enumerate(selected.iterrows(),1):
+        code0=str(setup["코드"]).zfill(6)
+        d=data_map.get(code0)
         if d is None:
             continue
-
-        for mode in V13_ENTRY_MODES:
-            entry = v13_make_entry(
-                d,
-                setup,
-                mode
-            )
-
-            if entry is None:
-                done += 1
-                continue
-
-            ev = v13_evaluate_trade(
-                d,
-                setup,
-                entry
-            )
-
-            row = setup.drop(
-                labels=[
-                    "_b",
-                    "_pull_i",
-                    "_breakout_i"
-                ],
-                errors="ignore"
-            ).to_dict()
-
-            row.update({
-                k:v for k,v in entry.items()
-                if not k.startswith("_")
-            })
-
-            row.update(ev)
-            row.update(setup_features(d, setup))
-            rows.append(row)
-
-            done += 1
-
-            if combo_total:
-                progress.progress(
-                    0.5 + min(done/combo_total,1.0)*0.5
-                )
+        entry=v13_make_entry(d,setup,"C 종가강도 종가베팅")
+        if entry is None:
+            continue
+        ev=v13_evaluate_trade(d,setup,entry)
+        row=setup.drop(labels=["_b","_pull_i","_breakout_i"],errors="ignore").to_dict()
+        row.update({k:v for k,v in entry.items() if not k.startswith("_")})
+        row.update(ev)
+        row.update(setup_features(d,setup))
+        rows.append(row)
+        if len(selected):
+            progress.progress(0.5+idx/(len(selected)*2))
 
     progress.empty()
+    c_df=pd.DataFrame(rows)
+    if c_df.empty:
+        status.warning("C전략 거래가 없습니다."); st.stop()
 
-    result = pd.DataFrame(rows)
+    status.success(f"완료 · KOSPI {len(universe)}종목 · C전략 거래 {len(c_df)}건")
 
-    if result.empty:
-        status.warning("실제 거래가 생성되지 않았습니다.")
-        st.stop()
+    st.subheader("① 전체 비교")
+    compare_df=v141_compare(c_df)
+    st.dataframe(compare_df,use_container_width=True,hide_index=True)
 
-    status.success(
-        f"완료 · KOSPI {len(universe)}종목 · "
-        f"F1+F2 setup {len(selected)}건 · "
-        f"진입전략 거래 {len(result)}건"
-    )
-
-    # ========================================================
-    # ① headline
-    # ========================================================
-    st.subheader("① 진입방식 전체 비교")
-
-    rank_df = v13_rank_table(result)
-
-    st.dataframe(
-        rank_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    top = rank_df.iloc[0]
-
+    top=compare_df.iloc[0]
     st.success(
-        f'현재 승률 1위: **{top["진입전략"]}** · '
-        f'승률 {top["승률(%)"]:.1f}% · '
-        f'{int(top["신호"])}건 · '
-        f'평균 {top["평균수익률(%)"]:.2f}% · '
-        f'PF {("-" if pd.isna(top["ProfitFactor"]) else f"{top["ProfitFactor"]:.2f}")} · '
+        f'승률 1위: {top["전략"]} · 승률 {top["승률(%)"]:.1f}% · '
+        f'{int(top["신호"])}건 · 평균 {top["평균수익률(%)"]:.2f}% · '
         f'손절률 {top["손절률(%)"]:.1f}%'
     )
 
-    # ========================================================
-    # ② paired signals A vs B
-    # ========================================================
-    st.subheader("② 같은 F1+F2 신호에서 A vs B 직접 비교")
+    st.subheader("② 시간순 60/40")
+    time_df=v141_time_split(c_df)
+    st.dataframe(time_df,use_container_width=True,hide_index=True)
 
-    a = result[result["진입전략"]=="A 현재 돌파진입"][
-        ["코드","돌파일","순수익률(%)"]
-    ].rename(columns={"순수익률(%)":"A수익률"})
+    st.subheader("③ 연도별 비교")
+    year_df=v141_yearly(c_df)
+    st.dataframe(year_df,use_container_width=True,hide_index=True)
 
-    b = result[result["진입전략"]=="B 돌파일 종가베팅"][
-        ["코드","돌파일","순수익률(%)"]
-    ].rename(columns={"순수익률(%)":"B수익률"})
+    st.subheader("④ 추가 구제 거래 성과")
+    rescue_df=v141_rescue_audit(c_df)
+    st.dataframe(rescue_df,use_container_width=True,hide_index=True)
 
-    paired = a.merge(
-        b,
-        on=["코드","돌파일"],
-        how="inner"
-    )
+    st.subheader("⑤ v14 1차에서 제거된 승리 vs 손실")
+    removed_df,removed_feat=v141_removed_analysis(c_df)
+    st.dataframe(removed_feat,use_container_width=True,hide_index=True)
 
-    if not paired.empty:
-        paired["A승리"] = paired["A수익률"] > 0
-        paired["B승리"] = paired["B수익률"] > 0
-        paired["B-A수익률차"] = paired["B수익률"] - paired["A수익률"]
+    st.subheader("⑥ 승률 우선 강건성 판정")
+    decision_rows=[]
+    for name in ["v14 1차","A 승률형","B 세력형","A+B 복합형"]:
+        q=v141_apply(c_df,name).sort_values("진입일").reset_index(drop=True)
+        full=v141_stats(q)
+        n=len(q); cutn=max(1,min(n-1,int(n*0.60))) if n>1 else 1
+        front=q.iloc[:cutn]; back=q.iloc[cutn:]
+        fs=v141_stats(front) if not front.empty else {}
+        bs=v141_stats(back) if not back.empty else {}
+        decision_rows.append({
+            "전략":name,
+            "전체신호":full["신호"],
+            "전체승률(%)":full["승률(%)"],
+            "전체평균(%)":full["평균수익률(%)"],
+            "전체PF":full["ProfitFactor"],
+            "앞60승률(%)":fs.get("승률(%)"),
+            "뒤40승률(%)":bs.get("승률(%)"),
+            "뒤40평균(%)":bs.get("평균수익률(%)"),
+            "뒤40PF":bs.get("ProfitFactor"),
+            "손절률(%)":full["손절률(%)"],
+        })
+    decision_df=pd.DataFrame(decision_rows)
+    st.dataframe(decision_df,use_container_width=True,hide_index=True)
 
-        pair_summary = pd.DataFrame([
-            {
-                "항목":"A만 승리",
-                "건수":int(((paired["A승리"]) & (~paired["B승리"])).sum())
-            },
-            {
-                "항목":"B만 승리",
-                "건수":int(((~paired["A승리"]) & (paired["B승리"])).sum())
-            },
-            {
-                "항목":"둘 다 승리",
-                "건수":int(((paired["A승리"]) & (paired["B승리"])).sum())
-            },
-            {
-                "항목":"둘 다 손실",
-                "건수":int(((~paired["A승리"]) & (~paired["B승리"])).sum())
-            },
-            {
-                "항목":"B 평균 개선폭(%)",
-                "건수":round(paired["B-A수익률차"].mean(),2)
-            },
-        ])
-
-        st.dataframe(
-            pair_summary,
-            use_container_width=True,
-            hide_index=True
-        )
-
-    # ========================================================
-    # ③ time robustness
-    # ========================================================
-    st.subheader("③ 전략별 시간순 60/40")
-
-    time_df = v13_time_split(
-        result,
-        0.60
-    )
-
-    st.dataframe(
-        time_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # ④ yearly
-    # ========================================================
-    st.subheader("④ 연도별 비교")
-
-    year_df = v13_yearly(
-        result
-    )
-
-    st.dataframe(
-        year_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # ⑤ C filter survival
-    # ========================================================
-    st.subheader("⑤ 종가강도형(C) 신호 보존율")
-
-    a_n = len(
-        result[result["진입전략"]=="A 현재 돌파진입"]
-    )
-    c_n = len(
-        result[result["진입전략"]=="C 종가강도 종가베팅"]
-    )
-
-    preservation = (
-        c_n / a_n * 100
-        if a_n else 0
-    )
-
-    c_stats = v13_stats(
-        result[
-            result["진입전략"]=="C 종가강도 종가베팅"
-        ].copy()
-    )
-
-    c_table = pd.DataFrame([
-        {
-            "기준F1+F2 신호":a_n,
-            "C 진입신호":c_n,
-            "신호보존율(%)":round(preservation,1),
-            "C 승률(%)":c_stats["승률(%)"],
-            "C 평균수익률(%)":c_stats["평균수익률(%)"],
-            "C PF":c_stats["ProfitFactor"],
-            "C 손절률(%)":c_stats["손절률(%)"],
-        }
-    ])
-
-    st.dataframe(
-        c_table,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # ⑥ decision
-    # ========================================================
-    st.subheader("⑥ 승률 우선 판정")
-
-    eligible = rank_df[
-        (rank_df["신호"] >= 30)
-        & (rank_df["평균수익률(%)"] > 0)
-        & (rank_df["ProfitFactor"].fillna(0) >= 1.5)
+    stable=decision_df[
+        (decision_df["전체신호"]>=25)
+        & (decision_df["전체승률(%)"]>=50)
+        & (decision_df["앞60승률(%)"]>=50)
+        & (decision_df["뒤40승률(%)"]>=50)
+        & (decision_df["전체평균(%)"]>0)
+        & (decision_df["전체PF"].fillna(0)>=2)
     ].copy()
 
-    if eligible.empty:
-        st.warning(
-            "충분한 표본과 수익성을 동시에 만족하는 진입방식이 없습니다."
-        )
+    if stable.empty:
+        st.warning("앞60/뒤40 모두 승률 50% 이상을 유지하는 후보가 없습니다.")
     else:
-        best = eligible.sort_values(
-            [
-                "승률(%)",
-                "신호",
-                "평균수익률(%)",
-                "ProfitFactor",
-                "손절률(%)"
-            ],
-            ascending=[
-                False,
-                False,
-                False,
-                False,
-                True
-            ]
+        best=stable.sort_values(
+            ["전체승률(%)","뒤40승률(%)","전체신호","전체평균(%)","전체PF"],
+            ascending=[False,False,False,False,False]
         ).iloc[0]
-
-        st.write(
-            f'**현재 우선 후보:** {best["진입전략"]}'
+        st.success(
+            f'강건성 1위: {best["전략"]} · 전체 {best["전체승률(%)"]:.1f}% · '
+            f'앞60 {best["앞60승률(%)"]:.1f}% · 뒤40 {best["뒤40승률(%)"]:.1f}%'
         )
 
-        if best["승률(%)"] >= 60:
-            st.success(
-                f'승률 {best["승률(%)"]:.1f}%로 60% 목표를 통과하면서 '
-                f'평균수익률 {best["평균수익률(%)"]:.2f}%를 유지했습니다.'
-            )
-        else:
-            st.warning(
-                f'최고 승률이 {best["승률(%)"]:.1f}%로 60%에 미달합니다. '
-                "종가베팅이 자동으로 승률을 높인다고 결론내리면 안 됩니다."
-            )
+    st.subheader("⑦ 거래별 필터 통과 여부")
+    audit=c_df.copy()
+    audit["v14_1차"]=v141_base_filter(audit).fillna(False)
+    audit["A승률형"]=v141_filter_a(audit).fillna(False)
+    audit["B세력형"]=v141_filter_b(audit).fillna(False)
+    audit["AB복합형"]=v141_filter_ab(audit).fillna(False)
 
-    # ========================================================
-    # ⑦ 시계열 오류 수정 감사
-    # ========================================================
-    st.subheader("⑦ v13.1 시계열 수정 감사")
-
-    timing_audit = pd.DataFrame([
-        {
-            "전략":"A 현재 돌파진입",
-            "진입시점":"돌파일 장중 돌파가",
-            "진입당일 Low 사용":"사용 안 함",
-            "진입당일 예외":"종가가 -3% 손절선 이하일 때만 확정손절",
-            "정상 청산평가":"다음 거래일부터"
-        },
-        {
-            "전략":"B 돌파일 종가베팅",
-            "진입시점":"돌파일 종가",
-            "진입당일 Low 사용":"사용 안 함",
-            "진입당일 예외":"없음",
-            "정상 청산평가":"다음 거래일부터"
-        },
-        {
-            "전략":"C 종가강도 종가베팅",
-            "진입시점":"돌파일 종가",
-            "진입당일 Low 사용":"사용 안 함",
-            "진입당일 예외":"없음",
-            "정상 청산평가":"다음 거래일부터"
-        },
-    ])
-
-    st.dataframe(
-        timing_audit,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # ⑧ actual trades
-    # ========================================================
-    st.subheader("⑧ 거래별 결과")
-
-    cols = [
-        "진입전략","종목명","코드","기준봉일","눌림일","돌파일",
-        "진입일","진입가","진입설명","청산평가시작",
-        "돌파종가수익률(%)","전고점20이격(%)",
-        "돌파봉종가위치(%)","진입5일선이격(%)",
-        "청산일","청산가","청산사유",
-        "순수익률(%)","MFE(%)","MAE(%)"
+    cols=[
+        "종목명","코드","진입일","순수익률(%)","청산사유",
+        "기준봉거래대금(억)","돌파거래량배수20","진입5일선이격(%)",
+        "돌파종가수익률(%)","전고점20이격(%)","눌림깊이(%)",
+        "v14_1차","A승률형","B세력형","AB복합형"
     ]
+    st.dataframe(audit[[c for c in cols if c in audit.columns]].sort_values("진입일",ascending=False),
+                 use_container_width=True,hide_index=True)
 
-    st.dataframe(
-        result[
-            [c for c in cols if c in result.columns]
-        ].sort_values(
-            ["진입일","종목명","진입전략"],
-            ascending=[False,True,True]
-        ),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # Excel
-    # ========================================================
-    st.subheader("⑨ 전체 v13.1 결과 Excel")
-
-    settings_df = pd.DataFrame([
-        {"항목":"종목선정","값":"F1+F2 고정"},
-        {"항목":"A","값":"눌림고가 돌파 당일 돌파가 진입"},
-        {"항목":"B","값":"F1+F2 돌파일 종가 진입"},
-        {"항목":"C","값":"B + 양봉 + 종가>5MA + 5MA상승 + 종가위치70%↑"},
-        {"항목":"청산","값":"-3% / +2% 활성 / 2% 트레일 / 진입 후 5거래일 / 비용0.40%"},
-        {"항목":"v13.1 수정","값":"B/C 진입당일 OHLC 미사용, A 당일 Low 미사용 + 종가 확정손절만 반영"},
-        {"항목":"평가우선순위","값":"승률 > 표본수 > 평균수익률 > PF > 손절률"},
+    st.subheader("⑧ 전체 v14.1 결과 Excel")
+    settings_df=pd.DataFrame([
+        {"항목":"기준전략","값":"C 종가강도 종가베팅"},
+        {"항목":"v14 1차","값":"돌파거래량배수20<=6 AND 진입5일선이격>=12%"},
+        {"항목":"A 승률형","값":"v14 1차 OR 진입5일선이격<=7%"},
+        {"항목":"B 세력형","값":"v14 1차 OR 기준봉거래대금>=6000억"},
+        {"항목":"A+B 복합형","값":"v14 1차 OR 진입5일선이격<=7% OR 기준봉거래대금>=6000억"},
+        {"항목":"평가우선순위","값":"승률 > 뒤40승률 > 신호수 > 평균수익률 > PF > 손절률"},
     ])
-
-    sheets = {
-        "00_설정": settings_df,
-        "01_전체비교": rank_df,
-        "02_시간60_40": time_df,
-        "03_연도별": year_df,
-        "04_C보존율": c_table,
-        "05_전체거래": result,
-        "06_시계열수정감사": timing_audit,
-    }
-
-    if not paired.empty:
-        sheets["07_A_B직접비교"] = paired
-        sheets["08_A_B요약"] = pair_summary
-
-    excel_bytes = build_excel(
-        sheets
-    )
-
+    excel_bytes=build_excel({
+        "00_설정":settings_df,
+        "01_전체비교":compare_df,
+        "02_시간60_40":time_df,
+        "03_연도별":year_df,
+        "04_구제거래감사":rescue_df,
+        "05_제거승패특성":removed_feat,
+        "06_강건성판정":decision_df,
+        "07_C전체거래":c_df,
+        "08_필터통과감사":audit,
+        "09_제거거래":removed_df,
+    })
     st.download_button(
-        "📦 v13.1 종가베팅 비교 수정판 Excel 다운로드",
+        "📦 v14.1 C전략 구제필터 비교 Excel 다운로드",
         data=excel_bytes,
-        file_name="swing_v13_1_close_bet_entry_comparison_fixed.xlsx",
+        file_name="swing_v14_1_c_strategy_rescue_filter_comparison.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
 
     if errors:
-        with st.expander(
-            f"조회 실패/데이터 부족 {len(errors)}건"
-        ):
+        with st.expander(f"조회 실패/데이터 부족 {len(errors)}건"):
             st.write(errors)
 
 st.caption(
-    "v13.1은 v13.0의 일봉 시계열 오류를 수정한 재검증판입니다. "
-    "F1+F2 종목선정과 A/B/C 조건은 동일하게 두고, 진입 당일 OHLC 시계열 오류만 수정하여 "
-    "승률이 실제로 개선되는지 비교합니다."
+    "v14.1은 C전략 구제필터 비교판입니다. "
+    "A/B/A+B를 같은 원본 C거래에서 비교하고 전체·앞60/뒤40·연도별 안정성을 함께 봅니다."
 )
