@@ -4174,11 +4174,61 @@ def j2_pairwise_same_signal(df, mode1, mode2):
 
 
 # ============================================================
-# J6.3 — data loading diagnostic
+# J6.4 — funnel diagnostic dashboard
+
+st.info("J6.4 수정사항: 데이터 조회기간만 220→300 달력일로 확대했습니다. 160봉 기준과 J1/J4/D진입 등 전략 조건은 변경하지 않았습니다.")
 # ============================================================
 
-def j63_data_loading_diagnostic(listing, per_market, asof_date, lookback_days=220):
-    start_ts = pd.Timestamp(asof_date) - pd.Timedelta(days=int(lookback_days))
+J4_PRIOR60_MAX = 12.905
+J4_MA5_GAP_MAX = 12.85
+J6_MAX_POSITIONS = 3
+
+J4_RULE_TEXT = (
+    f"전고점60이격(%) <= {J4_PRIOR60_MAX} "
+    f"AND 진입5일선이격(%) <= {J4_MA5_GAP_MAX}"
+)
+
+def j61_classify_candidate(row):
+    """
+    후보 상태를 3단계로 분류.
+    A: 완전 통과 — 실제 모의매매 대상
+    B: 5일선 눌림 대기 — J4 prior60 통과, 아직 D 진입 미발생
+    C: 근접 관찰 — J4 두 조건 중 하나만 근소하게 미달
+    """
+    p60 = pd.to_numeric(
+        pd.Series([row.get("전고점60이격(%)")]),
+        errors="coerce"
+    ).iloc[0]
+
+    ma5 = pd.to_numeric(
+        pd.Series([row.get("진입5일선이격(%)")]),
+        errors="coerce"
+    ).iloc[0]
+
+    state = str(row.get("현재상태", ""))
+
+    p60_ok = pd.notna(p60) and p60 <= J4_PRIOR60_MAX
+    ma5_ok = pd.notna(ma5) and ma5 <= J4_MA5_GAP_MAX
+
+    if state == "D진입 발생" and p60_ok and ma5_ok:
+        return "A 완전통과"
+
+    if state == "5일선 눌림 대기" and p60_ok:
+        return "B 5일선대기"
+
+    # Observation-only near misses.
+    # This does not relax the strategy. It only identifies names close to the frozen cut.
+    p60_near = pd.notna(p60) and J4_PRIOR60_MAX < p60 <= J4_PRIOR60_MAX + 3.0
+    ma5_near = pd.notna(ma5) and J4_MA5_GAP_MAX < ma5 <= J4_MA5_GAP_MAX + 3.0
+
+    if (p60_near and ma5_ok) or (p60_ok and ma5_near):
+        return "C 근접관찰"
+
+    return "제외"
+
+
+def j61_find_latest_candidates(listing, per_market, asof_date):
+    start_ts = pd.Timestamp(asof_date) - pd.Timedelta(days=300)
     fetch_end = pd.Timestamp(asof_date) + pd.Timedelta(days=1)
 
     rows = []
@@ -4197,19 +4247,166 @@ def j63_data_loading_diagnostic(listing, per_market, asof_date, lookback_days=22
             code = str(r["Code"]).zfill(6)
             name = r["Name"]
 
+            try:
+                d = load_data(
+                    code,
+                    start_ts.strftime("%Y-%m-%d"),
+                    fetch_end.strftime("%Y-%m-%d")
+                )
+
+                if d is None or d.empty or len(d) < 160:
+                    continue
+
+                found, prepared = j1_find_setups(
+                    d,
+                    code,
+                    name,
+                    market,
+                    pd.Timestamp(asof_date) - pd.Timedelta(days=45),
+                    pd.Timestamp(asof_date)
+                )
+
+                if not found:
+                    continue
+
+                found = sorted(
+                    found,
+                    key=lambda x: pd.Timestamp(x["돌파일"])
+                )
+                setup = found[-1]
+
+                entries = [
+                    e for e in j2_make_entries(
+                        prepared,
+                        pd.Series(setup),
+                        wait_days=5
+                    )
+                    if e["진입전략"] == "D 5일선 눌림"
+                ]
+
+                if entries:
+                    e = entries[-1]
+                    entry_date = pd.Timestamp(e["진입일"])
+                    age_days = (
+                        pd.Timestamp(asof_date).normalize()
+                        - entry_date.normalize()
+                    ).days
+
+                    row = dict(setup)
+                    row.update({
+                        "현재상태": "D진입 발생",
+                        "예상진입일": e["진입일"],
+                        "예상진입가": round(float(e["진입가"]), 2),
+                        "진입경과일": age_days,
+                    })
+
+                    # Only recent entries are relevant to today's operating screen.
+                    if age_days <= 2:
+                        row["후보등급"] = j61_classify_candidate(row)
+                        if row["후보등급"] != "제외":
+                            rows.append(row)
+                    continue
+
+                # Waiting for D entry after breakout
+                br_i = int(setup["_breakout_i"])
+                last_i = len(prepared) - 1
+                elapsed = last_i - br_i
+
+                if elapsed < 1 or elapsed > 5:
+                    continue
+
+                last = prepared.iloc[-1]
+                ma5 = float(last["MA5"]) if pd.notna(last["MA5"]) else None
+
+                if ma5 is None or ma5 <= 0:
+                    continue
+
+                # Current gap to MA5 is useful for watchlist only.
+                current_close = float(last["Close"])
+                current_ma5_gap = (
+                    (current_close / ma5 - 1) * 100
+                    if ma5 > 0 else None
+                )
+
+                row = dict(setup)
+                row.update({
+                    "현재상태": "5일선 눌림 대기",
+                    "예상진입일": None,
+                    "예상진입가": round(ma5, 2),
+                    "진입경과일": elapsed,
+                    "현재가": round(current_close, 2),
+                    "현재5일선": round(ma5, 2),
+                    "현재5일선이격(%)": round(current_ma5_gap, 2) if current_ma5_gap is not None else None,
+                })
+
+                # For waiting names, actual J4 MA5 gap is confirmed only at touch.
+                row["후보등급"] = j61_classify_candidate(row)
+
+                # Keep B waiting names even though eventual MA5-entry variable is not final yet.
+                p60 = pd.to_numeric(
+                    pd.Series([row.get("전고점60이격(%)")]),
+                    errors="coerce"
+                ).iloc[0]
+
+                if pd.notna(p60) and p60 <= J4_PRIOR60_MAX:
+                    row["후보등급"] = "B 5일선대기"
+                    rows.append(row)
+                    continue
+
+                # Near prior60 miss for observation.
+                if pd.notna(p60) and J4_PRIOR60_MAX < p60 <= J4_PRIOR60_MAX + 3.0:
+                    row["후보등급"] = "C 근접관찰"
+                    rows.append(row)
+
+            except Exception as e:
+                errors.append(
+                    f"{market} {name}({code}): {type(e).__name__}"
+                )
+
+    return pd.DataFrame(rows), errors
+
+
+
+def j64_diagnostic_funnel(listing, per_market, asof_date):
+    """
+    Frozen strategy diagnostic.
+    Counts how many names survive each stage without changing J1/J4 rules.
+    """
+    start_ts = pd.Timestamp(asof_date) - pd.Timedelta(days=300)
+    fetch_end = pd.Timestamp(asof_date) + pd.Timedelta(days=1)
+
+    counts = {
+        "검색대상": 0,
+        "데이터충분": 0,
+        "J1구조발견": 0,
+        "최근45일 J1구조": 0,
+        "돌파후5일이내": 0,
+        "D진입발생": 0,
+        "5일선대기": 0,
+        "J4_전고점60통과": 0,
+        "J4_5일선이격통과": 0,
+        "A_완전통과": 0,
+    }
+
+    detail = []
+    errors = []
+
+    for market in ["KOSPI", "KOSDAQ"]:
+        universe = (
+            listing[listing["Market"] == market]
+            .sort_values("Code")
+            .head(int(per_market))
+            .copy()
+            .reset_index(drop=True)
+        )
+        counts["검색대상"] += len(universe)
+
+        for _, r in universe.iterrows():
+            code = str(r["Code"]).zfill(6)
+            name = r["Name"]
             rec = {
-                "시장": market,
-                "종목명": name,
-                "코드": code,
-                "조회시작": start_ts.date(),
-                "조회종료": fetch_end.date(),
-                "조회성공": False,
-                "봉수": 0,
-                "160봉이상": False,
-                "최초일": None,
-                "최종일": None,
-                "상태": "",
-                "예외": "",
+                "시장": market, "종목명": name, "코드": code,
+                "최종단계": "데이터조회전", "탈락사유": ""
             }
 
             try:
@@ -4218,120 +4415,230 @@ def j63_data_loading_diagnostic(listing, per_market, asof_date, lookback_days=22
                     start_ts.strftime("%Y-%m-%d"),
                     fetch_end.strftime("%Y-%m-%d")
                 )
-
-                if d is None:
-                    rec["상태"] = "None 반환"
-                    rows.append(rec)
+                if d is None or d.empty or len(d) < 160:
+                    rec["최종단계"] = "데이터부족"
+                    rec["탈락사유"] = "160봉 미만/데이터 없음"
+                    detail.append(rec)
                     continue
 
-                if d.empty:
-                    rec["상태"] = "빈 DataFrame"
-                    rows.append(rec)
+                counts["데이터충분"] += 1
+                rec["최종단계"] = "데이터충분"
+
+                found, prepared = j1_find_setups(
+                    d, code, name, market,
+                    pd.Timestamp(asof_date) - pd.Timedelta(days=45),
+                    pd.Timestamp(asof_date)
+                )
+                if not found:
+                    rec["탈락사유"] = "J1 구조 없음"
+                    detail.append(rec)
                     continue
 
-                rec["조회성공"] = True
-                rec["봉수"] = int(len(d))
+                counts["J1구조발견"] += 1
+                counts["최근45일 J1구조"] += 1
+                rec["최종단계"] = "J1구조발견"
 
-                try:
-                    rec["최초일"] = pd.Timestamp(d.index.min()).date()
-                    rec["최종일"] = pd.Timestamp(d.index.max()).date()
-                except Exception:
-                    pass
+                found = sorted(found, key=lambda x: pd.Timestamp(x["돌파일"]))
+                setup = found[-1]
+                br_i = int(setup["_breakout_i"])
+                last_i = len(prepared) - 1
+                elapsed = last_i - br_i
+                rec["돌파일"] = setup.get("돌파일")
+                rec["돌파후경과봉"] = elapsed
+                rec["전고점60이격(%)"] = setup.get("전고점60이격(%)")
+                rec["기준봉거래대금(억)"] = setup.get("기준봉거래대금(억)")
+                rec["구조거래량수축"] = setup.get("구조거래량수축")
 
-                rec["160봉이상"] = len(d) >= 160
+                if elapsed < 1 or elapsed > 5:
+                    rec["탈락사유"] = f"돌파 후 {elapsed}봉: 1~5봉 범위 밖"
+                    detail.append(rec)
+                    continue
 
-                if len(d) >= 160:
-                    rec["상태"] = "정상"
-                elif len(d) >= 120:
-                    rec["상태"] = "데이터 정상 추정 / 160봉 미만"
+                counts["돌파후5일이내"] += 1
+                rec["최종단계"] = "돌파후5일이내"
+
+                p60 = pd.to_numeric(
+                    pd.Series([setup.get("전고점60이격(%)")]),
+                    errors="coerce"
+                ).iloc[0]
+                p60_ok = pd.notna(p60) and p60 <= J4_PRIOR60_MAX
+                if p60_ok:
+                    counts["J4_전고점60통과"] += 1
+
+                entries = [
+                    e for e in j2_make_entries(
+                        prepared, pd.Series(setup), wait_days=5
+                    )
+                    if e["진입전략"] == "D 5일선 눌림"
+                ]
+
+                if not entries:
+                    counts["5일선대기"] += 1
+                    rec["최종단계"] = "5일선대기"
+                    rec["탈락사유"] = (
+                        "D 첫 5일선 터치 미발생"
+                        if p60_ok else
+                        f"전고점60 이격 {p60:.2f}% > {J4_PRIOR60_MAX}%"
+                    )
+                    detail.append(rec)
+                    continue
+
+                counts["D진입발생"] += 1
+                e = entries[-1]
+                rec["진입일"] = e.get("진입일")
+                rec["진입가"] = e.get("진입가")
+                rec["진입5일선이격(%)"] = e.get("진입5일선이격(%)",
+                                               setup.get("진입5일선이격(%)"))
+
+                ma5gap = pd.to_numeric(
+                    pd.Series([rec.get("진입5일선이격(%)")]),
+                    errors="coerce"
+                ).iloc[0]
+                ma5_ok = pd.notna(ma5gap) and ma5gap <= J4_MA5_GAP_MAX
+
+                if ma5_ok:
+                    counts["J4_5일선이격통과"] += 1
+
+                if p60_ok and ma5_ok:
+                    counts["A_완전통과"] += 1
+                    rec["최종단계"] = "A완전통과"
+                    rec["탈락사유"] = ""
                 else:
-                    rec["상태"] = "봉수 부족"
+                    rec["최종단계"] = "J4필터"
+                    reasons = []
+                    if not p60_ok:
+                        reasons.append(
+                            f"전고점60 {p60:.2f}% > {J4_PRIOR60_MAX}%"
+                            if pd.notna(p60) else "전고점60 값 없음"
+                        )
+                    if not ma5_ok:
+                        reasons.append(
+                            f"5일선이격 {ma5gap:.2f}% > {J4_MA5_GAP_MAX}%"
+                            if pd.notna(ma5gap) else "5일선이격 값 없음"
+                        )
+                    rec["탈락사유"] = " / ".join(reasons)
 
-                rows.append(rec)
+                detail.append(rec)
 
             except Exception as e:
-                rec["상태"] = "조회예외"
-                rec["예외"] = f"{type(e).__name__}: {str(e)[:180]}"
-                rows.append(rec)
-                errors.append(
-                    f"{market} {name}({code}): "
-                    f"{type(e).__name__}: {str(e)[:180]}"
-                )
+                rec["최종단계"] = "오류"
+                rec["탈락사유"] = type(e).__name__
+                detail.append(rec)
+                errors.append(f"{market} {name}({code}): {type(e).__name__}")
 
-    df = pd.DataFrame(rows)
+    funnel = pd.DataFrame([
+        {"단계": k, "종목수": v} for k, v in counts.items()
+    ])
+    detail_df = pd.DataFrame(detail)
+    return funnel, detail_df, errors
 
-    if df.empty:
-        summary = pd.DataFrame()
+def j6_priority_score(df):
+    q = df.copy()
+
+    for c in [
+        "전고점60이격(%)",
+        "진입5일선이격(%)",
+        "구조거래량수축",
+        "기준봉거래대금(억)"
+    ]:
+        if c not in q.columns:
+            q[c] = np.nan
+        q[c] = pd.to_numeric(q[c], errors="coerce")
+
+    q["_r1"] = q["전고점60이격(%)"].rank(
+        method="min", ascending=True, na_option="bottom"
+    )
+    q["_r2"] = q["진입5일선이격(%)"].rank(
+        method="min", ascending=True, na_option="bottom"
+    )
+    q["_r3"] = q["구조거래량수축"].rank(
+        method="min", ascending=True, na_option="bottom"
+    )
+    q["_r4"] = q["기준봉거래대금(억)"].rank(
+        method="min", ascending=False, na_option="bottom"
+    )
+
+    q["운용우선순위점수"] = (
+        q["_r1"] * 0.40
+        + q["_r2"] * 0.30
+        + q["_r3"] * 0.20
+        + q["_r4"] * 0.10
+    )
+
+    q = q.sort_values(
+        ["운용우선순위점수", "돌파일"],
+        ascending=[True, False]
+    ).reset_index(drop=True)
+
+    q["우선순위"] = range(1, len(q) + 1)
+
+    return q.drop(
+        columns=["_r1","_r2","_r3","_r4"],
+        errors="ignore"
+    )
+
+
+def j61_order_plan(pass_df, paper_cash, existing_positions):
+    slots = max(
+        0,
+        J6_MAX_POSITIONS - int(existing_positions)
+    )
+
+    q = pass_df.copy()
+
+    if q.empty:
+        q["모의매매선정"] = False
+        q["배정금액"] = 0
+        return q, slots
+
+    q = j6_priority_score(q)
+
+    q["모의매매선정"] = (
+        q["우선순위"] <= slots
+    )
+
+    allocation = (
+        float(paper_cash) / slots
+        if slots > 0 else 0
+    )
+
+    q["배정금액"] = q["모의매매선정"].map(
+        lambda x: round(allocation) if x else 0
+    )
+
+    return q, slots
+
+
+def j6_position_management(entry_price, current_price, highest_price):
+    entry_price = float(entry_price)
+    current_price = float(current_price)
+    highest_price = float(highest_price)
+
+    initial_stop = entry_price * 0.97
+    activated = highest_price >= entry_price * 1.02
+
+    if activated:
+        trailing = highest_price * 0.98
+        active_stop = max(entry_price, trailing)
+        state = "트레일 활성"
     else:
-        summary = pd.DataFrame([
-            {"항목":"검색대상", "값":len(df)},
-            {"항목":"조회성공", "값":int(df["조회성공"].sum())},
-            {"항목":"160봉이상", "값":int(df["160봉이상"].sum())},
-            {"항목":"160봉미만", "값":int((df["조회성공"] & ~df["160봉이상"]).sum())},
-            {"항목":"조회실패/예외", "값":int((~df["조회성공"]).sum())},
-            {"항목":"평균봉수", "값":round(pd.to_numeric(df["봉수"], errors="coerce").mean(),1)},
-            {"항목":"최대봉수", "값":int(pd.to_numeric(df["봉수"], errors="coerce").max())},
-            {"항목":"최소봉수(성공건)", "값":int(pd.to_numeric(df.loc[df["조회성공"],"봉수"], errors="coerce").min()) if df["조회성공"].any() else 0},
-        ])
+        active_stop = initial_stop
+        state = "초기 손절 구간"
 
-    return df, summary, errors
-
-
-def j63_compare_lookbacks(listing, sample_per_market, asof_date, lookbacks=(220,260,300,365)):
-    """
-    소수 샘플로 조회기간별 실제 봉수 비교.
-    220달력일이 160거래일 확보에 충분한지 판단한다.
-    """
-    rows = []
-
-    sample = pd.concat([
-        listing[listing["Market"]=="KOSPI"].sort_values("Code").head(int(sample_per_market)),
-        listing[listing["Market"]=="KOSDAQ"].sort_values("Code").head(int(sample_per_market)),
-    ], ignore_index=True)
-
-    for lb in lookbacks:
-        start_ts = pd.Timestamp(asof_date) - pd.Timedelta(days=int(lb))
-        fetch_end = pd.Timestamp(asof_date) + pd.Timedelta(days=1)
-
-        counts = []
-
-        for _, r in sample.iterrows():
-            code = str(r["Code"]).zfill(6)
-
-            try:
-                d = load_data(
-                    code,
-                    start_ts.strftime("%Y-%m-%d"),
-                    fetch_end.strftime("%Y-%m-%d")
-                )
-                if d is not None and not d.empty:
-                    counts.append(len(d))
-            except Exception:
-                pass
-
-        if counts:
-            rows.append({
-                "달력조회일수": int(lb),
-                "성공샘플": len(counts),
-                "평균봉수": round(float(np.mean(counts)),1),
-                "최소봉수": int(np.min(counts)),
-                "최대봉수": int(np.max(counts)),
-                "160봉이상비율(%)": round(
-                    sum(c >= 160 for c in counts) / len(counts) * 100,
-                    1
-                ),
-            })
-        else:
-            rows.append({
-                "달력조회일수": int(lb),
-                "성공샘플": 0,
-                "평균봉수": 0,
-                "최소봉수": 0,
-                "최대봉수": 0,
-                "160봉이상비율(%)": 0,
-            })
-
-    return pd.DataFrame(rows)
+    return {
+        "상태": state,
+        "초기손절가": round(initial_stop, 2),
+        "활성기준가(+2%)": round(entry_price * 1.02, 2),
+        "현재유효손절가": round(active_stop, 2),
+        "현재수익률(%)": round(
+            (current_price / entry_price - 1) * 100,
+            2
+        ),
+        "고점대비하락률(%)": round(
+            (current_price / highest_price - 1) * 100,
+            2
+        ) if highest_price > 0 else None,
+    }
 
 
 # ============================================================
@@ -4339,20 +4646,18 @@ def j63_compare_lookbacks(listing, sample_per_market, asof_date, lookbacks=(220,
 # ============================================================
 
 st.set_page_config(
-    page_title="J6.3 데이터 로딩 진단",
+    page_title="J6.1 모의매매 운영판",
     layout="wide"
 )
 
 st.title(
-    "🛠️ J6.3 · 데이터 로딩 원인 진단판"
+    "🟢 J6.4 · 후보 0건 원인 진단판"
 )
 
-st.caption(
-    "전략 조건은 평가하지 않고, 종목 데이터가 왜 160봉을 확보하지 못하는지만 확인합니다."
-)
+st.caption("조건은 변경하지 않고, 어느 단계에서 후보가 사라지는지 카운트합니다.")
 
 with st.sidebar:
-    st.header("J6.3 진단 설정")
+    st.header("J6.4 진단 설정")
 
     asof_date = st.date_input(
         "기준일",
@@ -4360,33 +4665,63 @@ with st.sidebar:
     )
 
     per_market = st.selectbox(
-        "시장별 진단 종목 수",
-        [50,100,300,500],
+        "시장별 검색 종목 수",
+        [300,500,700],
         index=1
     )
 
-    lookback_days = st.selectbox(
-        "기본 조회기간(달력일)",
-        [180,220,260,300,365],
-        index=1
+    paper_cash = st.number_input(
+        "모의계좌 가용현금(원)",
+        min_value=0,
+        max_value=1_000_000_000,
+        value=10_000_000,
+        step=100_000
     )
 
-    sample_per_market = st.selectbox(
-        "조회기간 비교 샘플 수/시장",
-        [5,10,20],
-        index=1
+    existing_positions = st.number_input(
+        "현재 보유종목 수",
+        min_value=0,
+        max_value=3,
+        value=0,
+        step=1
     )
 
     run = st.button(
-        "▶ 데이터 로딩 진단 실행",
+        "▶ 오늘 후보 + 관찰리스트 검색",
         type="primary",
         use_container_width=True
     )
 
 st.info(
-    "현재 목표는 '후보가 왜 0건인지'가 아니라 그보다 앞 단계인 "
-    "'왜 데이터충분이 0건인지'를 확인하는 것입니다. "
-    "J1/J4/J6 매매조건은 이번 진단에서 전혀 변경하지 않습니다."
+    f"고정 매매규칙: J1 구조 → D 첫 5일선 눌림 → {J4_RULE_TEXT}. "
+    "B/C 등급은 관찰용이며 매수 조건을 완화한 것이 아닙니다. "
+    "실제 모의매수 후보는 A 완전통과만 사용합니다."
+)
+
+st.subheader("① 후보 등급")
+
+grade_df = pd.DataFrame([
+    {
+        "등급":"A 완전통과",
+        "의미":"D 5일선 진입 발생 + J4 두 조건 모두 통과",
+        "매수":"모의매매 가능"
+    },
+    {
+        "등급":"B 5일선대기",
+        "의미":"J1/J4 구조는 유효, 아직 5일선 첫 터치를 기다리는 상태",
+        "매수":"대기"
+    },
+    {
+        "등급":"C 근접관찰",
+        "의미":"J4 한 조건이 컷에서 최대 +3%p 이내 부족",
+        "매수":"금지 / 관찰만"
+    },
+])
+
+st.dataframe(
+    grade_df,
+    use_container_width=True,
+    hide_index=True
 )
 
 if run:
@@ -4400,151 +4735,271 @@ if run:
         st.stop()
 
     with st.spinner(
-        "종목별 데이터 조회 상태를 확인 중입니다..."
+        "J6.4 단계별 탈락 원인을 진단 중입니다..."
     ):
-        detail, summary, errors = j63_data_loading_diagnostic(
+        funnel, diagnostic_detail, diagnostic_errors = j64_diagnostic_funnel(
             listing,
             int(per_market),
-            pd.Timestamp(asof_date),
-            int(lookback_days)
+            pd.Timestamp(asof_date)
         )
 
-    st.subheader("① 데이터 로딩 요약")
+    st.subheader("② 단계별 후보 Funnel")
+    st.dataframe(funnel, use_container_width=True, hide_index=True)
 
-    st.dataframe(
-        summary,
-        use_container_width=True,
-        hide_index=True
-    )
+    if not funnel.empty:
+        vals = dict(zip(funnel["단계"], funnel["종목수"]))
+        st.write(
+            f"검색 {vals.get('검색대상',0)} → "
+            f"데이터충분 {vals.get('데이터충분',0)} → "
+            f"J1구조 {vals.get('J1구조발견',0)} → "
+            f"돌파후5일 {vals.get('돌파후5일이내',0)} → "
+            f"D진입 {vals.get('D진입발생',0)} → "
+            f"A완전통과 {vals.get('A_완전통과',0)}"
+        )
 
-    if not summary.empty:
-        s = dict(zip(summary["항목"], summary["값"]))
-
-        success = int(s.get("조회성공", 0))
-        enough = int(s.get("160봉이상", 0))
-        total = int(s.get("검색대상", 0))
-
-        if success == 0:
-            st.error(
-                "조회성공이 0건입니다. 이 경우 160봉 조건이 아니라 "
-                "load_data/FDR/데이터소스 자체를 먼저 점검해야 합니다."
-            )
-        elif enough == 0:
-            st.warning(
-                f"데이터 조회는 {success}/{total}건 성공했지만 160봉 이상이 0건입니다. "
-                "조회기간이 짧을 가능성이 큽니다."
-            )
-        else:
-            st.success(
-                f"160봉 이상 확보 종목이 {enough}건 있습니다. "
-                "J6.2의 데이터충분 0건은 별도 로직 문제일 가능성이 있습니다."
-            )
-
-    st.subheader("② 종목별 데이터 상태")
-
-    if detail.empty:
-        st.info("상세 결과가 없습니다.")
+    st.subheader("③ 종목별 최종 탈락 단계")
+    if diagnostic_detail.empty:
+        st.info("진단 상세 데이터가 없습니다.")
     else:
         st.dataframe(
-            detail,
+            diagnostic_detail,
             use_container_width=True,
             hide_index=True
         )
 
-    st.subheader("③ 상태별 집계")
-
-    if not detail.empty:
-        state_summary = (
-            detail.groupby("상태", dropna=False)
+        stage_summary = (
+            diagnostic_detail.groupby(["최종단계","탈락사유"], dropna=False)
             .size()
             .reset_index(name="종목수")
             .sort_values("종목수", ascending=False)
         )
+        st.subheader("④ 주요 탈락 원인")
+        st.dataframe(stage_summary, use_container_width=True, hide_index=True)
+
+    with st.spinner(
+        "완전통과·대기·근접 후보를 검색 중입니다..."
+    ):
+        candidates, errors = j61_find_latest_candidates(
+            listing,
+            int(per_market),
+            pd.Timestamp(asof_date)
+        )
+
+    if candidates.empty:
+        st.warning(
+            "오늘은 완전통과·대기·근접 관찰 후보가 모두 없습니다."
+        )
+    else:
+        a_df = candidates[
+            candidates["후보등급"] == "A 완전통과"
+        ].copy()
+
+        b_df = candidates[
+            candidates["후보등급"] == "B 5일선대기"
+        ].copy()
+
+        c_df = candidates[
+            candidates["후보등급"] == "C 근접관찰"
+        ].copy()
+
+        st.subheader("② A 완전통과 — 오늘 모의매매 후보")
+
+        if a_df.empty:
+            st.info("오늘 A 완전통과 후보는 없습니다.")
+            plan = pd.DataFrame()
+            slots = max(0, J6_MAX_POSITIONS - int(existing_positions))
+        else:
+            plan, slots = j61_order_plan(
+                a_df,
+                int(paper_cash),
+                int(existing_positions)
+            )
+
+            cols = [
+                "우선순위","시장","종목명","코드",
+                "돌파일","예상진입일","예상진입가",
+                "전고점60이격(%)","진입5일선이격(%)",
+                "구조거래량수축","기준봉거래대금(억)",
+                "모의매매선정","배정금액"
+            ]
+
+            st.dataframe(
+                plan[[c for c in cols if c in plan.columns]],
+                use_container_width=True,
+                hide_index=True
+            )
+
+        st.subheader("③ B 5일선 눌림 대기 — 관심종목")
+
+        if b_df.empty:
+            st.info("현재 5일선 눌림 대기 종목은 없습니다.")
+        else:
+            b_df = j6_priority_score(b_df)
+
+            b_cols = [
+                "우선순위","시장","종목명","코드",
+                "돌파일","진입경과일","현재가",
+                "현재5일선","현재5일선이격(%)",
+                "예상진입가","전고점60이격(%)",
+                "구조거래량수축","기준봉거래대금(억)"
+            ]
+
+            st.dataframe(
+                b_df[[c for c in b_cols if c in b_df.columns]],
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.caption(
+                "B등급은 5일선 가격에 미리 매수하는 목록이 아닙니다. "
+                "실제 첫 터치가 발생하고 최종 J4 조건을 확인한 뒤 A등급으로 전환될 때만 모의매수합니다."
+            )
+
+        st.subheader("④ C 근접 관찰 — 왜 탈락했는지 확인")
+
+        if c_df.empty:
+            st.info("현재 근접 관찰 종목은 없습니다.")
+        else:
+            c_df = j6_priority_score(c_df)
+
+            def fail_reason(r):
+                reasons = []
+                p60 = pd.to_numeric(
+                    pd.Series([r.get("전고점60이격(%)")]),
+                    errors="coerce"
+                ).iloc[0]
+                ma5 = pd.to_numeric(
+                    pd.Series([r.get("진입5일선이격(%)")]),
+                    errors="coerce"
+                ).iloc[0]
+
+                if pd.notna(p60) and p60 > J4_PRIOR60_MAX:
+                    reasons.append(
+                        f"전고점60 +{p60-J4_PRIOR60_MAX:.2f}%p 초과"
+                    )
+                if pd.notna(ma5) and ma5 > J4_MA5_GAP_MAX:
+                    reasons.append(
+                        f"5일선이격 +{ma5-J4_MA5_GAP_MAX:.2f}%p 초과"
+                    )
+                return " / ".join(reasons) if reasons else "관찰"
+
+            c_df["탈락사유"] = c_df.apply(fail_reason, axis=1)
+
+            c_cols = [
+                "우선순위","시장","종목명","코드",
+                "현재상태","돌파일",
+                "전고점60이격(%)","진입5일선이격(%)",
+                "탈락사유","예상진입가"
+            ]
+
+            st.dataframe(
+                c_df[[c for c in c_cols if c in c_df.columns]],
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.warning(
+                "C등급은 백테스트 조건을 완화한 후보가 아닙니다. "
+                "실제 모의매수 금지이며, 향후 조건 근처 종목이 어떻게 움직이는지 관찰하기 위한 목록입니다."
+            )
+
+        st.subheader("⑤ 오늘 전체 현황")
+
+        summary = pd.DataFrame([
+            {"구분":"A 완전통과","종목수":len(a_df)},
+            {"구분":"B 5일선대기","종목수":len(b_df)},
+            {"구분":"C 근접관찰","종목수":len(c_df)},
+        ])
 
         st.dataframe(
-            state_summary,
+            summary,
             use_container_width=True,
             hide_index=True
         )
 
-    st.subheader("④ 조회기간별 실제 봉수 비교")
+        settings = pd.DataFrame([
+            {"항목":"고정전략","값":f"J1 구조 + D 5일선 눌림 + {J4_RULE_TEXT}"},
+            {"항목":"최대동시보유","값":J6_MAX_POSITIONS},
+            {"항목":"실제모의매수","값":"A 완전통과만"},
+            {"항목":"B등급","값":"5일선 눌림 대기 / 매수 금지"},
+            {"항목":"C등급","값":"J4 한 조건 최대 +3%p 근접 / 매수 금지"},
+            {"항목":"조건변경","값":"없음"},
+        ])
 
-    with st.spinner(
-        "220/260/300/365일 조회기간을 소수 샘플에서 비교 중입니다..."
-    ):
-        lookback_compare = j63_compare_lookbacks(
-            listing,
-            int(sample_per_market),
-            pd.Timestamp(asof_date),
-            lookbacks=(220,260,300,365)
+        sheets = {
+            "00_설정": settings,
+            "01_진단Funnel": funnel,
+            "02_진단상세": diagnostic_detail,
+            "03_현황": summary,
+            "04_A완전통과": plan if not a_df.empty else a_df,
+            "05_B5일선대기": b_df,
+            "06_C근접관찰": c_df,
+            "07_전체후보": candidates,
+        }
+
+        excel_bytes = build_excel(sheets)
+
+        st.download_button(
+            "📦 J6.4 진단 Excel 다운로드",
+            data=excel_bytes,
+            file_name=(
+                f"J6_2_diagnostic_"
+                f"{pd.Timestamp(asof_date).strftime('%Y%m%d')}.xlsx"
+            ),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
         )
 
+    errors = list(diagnostic_errors) + list(errors)
+
+    if errors:
+        with st.expander(
+            f"조회 실패/데이터 부족 {len(errors)}건"
+        ):
+            st.write(errors)
+
+st.subheader("⑥ 보유종목 청산 계산기")
+
+c1, c2, c3 = st.columns(3)
+
+with c1:
+    calc_entry = st.number_input(
+        "진입가",
+        min_value=0.0,
+        value=0.0,
+        step=100.0
+    )
+
+with c2:
+    calc_current = st.number_input(
+        "현재가",
+        min_value=0.0,
+        value=0.0,
+        step=100.0
+    )
+
+with c3:
+    calc_high = st.number_input(
+        "진입 후 최고가",
+        min_value=0.0,
+        value=0.0,
+        step=100.0
+    )
+
+if calc_entry > 0 and calc_current > 0 and calc_high > 0:
+    mgmt = j6_position_management(
+        calc_entry,
+        calc_current,
+        calc_high
+    )
+
     st.dataframe(
-        lookback_compare,
+        pd.DataFrame([mgmt]),
         use_container_width=True,
         hide_index=True
     )
 
-    if not lookback_compare.empty:
-        valid = lookback_compare[
-            lookback_compare["160봉이상비율(%)"] >= 90
-        ]
-
-        if not valid.empty:
-            recommended = int(
-                valid.sort_values("달력조회일수").iloc[0]["달력조회일수"]
-            )
-
-            st.success(
-                f"샘플 기준 160거래일을 안정적으로 확보하려면 "
-                f"최소 약 {recommended}달력일 조회가 적절해 보입니다."
-            )
-        else:
-            st.warning(
-                "365일 조회에서도 160봉 확보율이 충분하지 않습니다. "
-                "조회기간보다 데이터소스/종목코드/거래정지 종목 등의 문제를 봐야 합니다."
-            )
-
-    st.subheader("⑤ J6.3 진단 Excel")
-
-    settings = pd.DataFrame([
-        {"항목":"기준일", "값":str(asof_date)},
-        {"항목":"시장별진단종목수", "값":int(per_market)},
-        {"항목":"기본조회기간", "값":f"{int(lookback_days)} 달력일"},
-        {"항목":"160봉조건", "값":"기존 J6.2와 동일"},
-        {"항목":"전략조건", "값":"이번 진단에서는 미평가"},
-    ])
-
-    sheets = {
-        "00_설정": settings,
-        "01_요약": summary,
-        "02_종목별상세": detail,
-        "03_조회기간비교": lookback_compare,
-    }
-
-    excel_bytes = build_excel(sheets)
-
-    st.download_button(
-        "📦 J6.3 데이터 진단 Excel 다운로드",
-        data=excel_bytes,
-        file_name=(
-            f"J6_3_data_loading_diagnostic_"
-            f"{pd.Timestamp(asof_date).strftime('%Y%m%d')}.xlsx"
-        ),
-        mime=(
-            "application/"
-            "vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-        use_container_width=True
-    )
-
-    if errors:
-        with st.expander(
-            f"조회 오류 {len(errors)}건"
-        ):
-            st.write(errors[:200])
-
 st.caption(
-    "J6.3은 데이터 로딩만 진단합니다. 결과를 확인한 뒤에야 J6 운영판의 조회기간 또는 로딩 로직을 수정합니다."
+    "J6.4는 조건을 변경하지 않고 후보가 사라지는 단계를 진단하는 운영판입니다. "
+    "B/C 등급은 매수 조건이 아니며, A 완전통과만 실제 모의매매 대상으로 사용합니다."
 )
