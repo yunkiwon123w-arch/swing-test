@@ -5,9 +5,9 @@ import time
 from datetime import date
 from io import BytesIO
 
-st.set_page_config(page_title="J1 v1.0 종산형 구조탐색", layout="wide")
-st.title("🧭 J1 v1.0 · 자금유입→눌림/횡보→재돌파 구조탐색")
-st.caption("종산 자료에서 반복된 구조 가설을 정량화 · KOSPI+KOSDAQ · IS에서만 후보선택 · OOS 검증")
+st.set_page_config(page_title="J2 v1.0 진입타이밍 분해검증", layout="wide")
+st.title("🎯 J2 v1.0 · 동일 J1 신호의 진입타이밍 분해검증")
+st.caption("종목선정/J1 구조 고정 · 돌파종가 vs 익일시가 vs 첫눌림 vs 5일선눌림 vs 관문재확인 · 승률 우선")
 
 # ============================================================
 # 완전 동결된 전략값
@@ -3450,232 +3450,971 @@ def j1_stress(df):
     return pd.DataFrame(rows)
 
 
+
+# ============================================================
+# J2 v1.0 — entry timing decomposition
+# ============================================================
+
+J2_ENTRY_MODES = [
+    "A 돌파당일 종가",
+    "B 익일 시가",
+    "C 첫 2% 눌림",
+    "D 5일선 눌림",
+    "E 관문 재확인",
+]
+
+def j2_make_entries(d, setup, wait_days=5):
+    """
+    동일한 J1 구조 신호에서 진입 시점만 비교한다.
+
+    A: 재돌파일 종가
+    B: 다음 거래일 시가
+    C: 재돌파 후 최대 wait_days 이내, 돌파종가 대비 -2% 가격을
+       처음 터치한 날 해당 가격에 지정가 체결
+    D: 재돌파 후 최대 wait_days 이내, 당일 MA5가 일중 범위 안에
+       처음 들어온 날 MA5 가격에 체결
+    E: 재돌파 후 최대 wait_days 이내, 구조관문 가격이 일중 범위 안에
+       처음 들어온 날 관문 가격에 체결
+
+    C/D/E는 '가장 좋은 날'을 고르지 않고 첫 발생만 사용한다.
+    """
+    br_i = int(setup["_breakout_i"])
+    br = d.iloc[br_i]
+    br_close = float(br["Close"])
+    gate = float(setup["구조관문"])
+
+    entries = []
+
+    # A — close
+    entries.append({
+        "진입전략": "A 돌파당일 종가",
+        "진입일": d.index[br_i].date(),
+        "진입가": br_close,
+        "_entry_i": br_i,
+        "_eval_start_i": br_i + 1,
+        "대기일수": 0,
+        "진입설명": "관문 재돌파 당일 종가",
+    })
+
+    # B — next open
+    if br_i + 1 < len(d):
+        i = br_i + 1
+        entries.append({
+            "진입전략": "B 익일 시가",
+            "진입일": d.index[i].date(),
+            "진입가": float(d.iloc[i]["Open"]),
+            "_entry_i": i,
+            "_eval_start_i": i + 1,  # 동일 기준: 진입일 OHLC는 평가 제외
+            "대기일수": 1,
+            "진입설명": "관문 재돌파 다음 거래일 시가",
+        })
+
+    end_i = min(len(d) - 1, br_i + int(wait_days))
+
+    # C — first 2% pullback
+    target = br_close * 0.98
+    for i in range(br_i + 1, end_i + 1):
+        r = d.iloc[i]
+        low, high = float(r["Low"]), float(r["High"])
+        if low <= target <= high:
+            entries.append({
+                "진입전략": "C 첫 2% 눌림",
+                "진입일": d.index[i].date(),
+                "진입가": target,
+                "_entry_i": i,
+                "_eval_start_i": i + 1,
+                "대기일수": i - br_i,
+                "진입설명": "돌파종가 대비 -2% 첫 지정가 터치",
+            })
+            break
+
+    # D — first MA5 touch
+    for i in range(br_i + 1, end_i + 1):
+        r = d.iloc[i]
+        if pd.isna(r.get("MA5", None)):
+            continue
+        ma5 = float(r["MA5"])
+        low, high = float(r["Low"]), float(r["High"])
+        if low <= ma5 <= high:
+            entries.append({
+                "진입전략": "D 5일선 눌림",
+                "진입일": d.index[i].date(),
+                "진입가": ma5,
+                "_entry_i": i,
+                "_eval_start_i": i + 1,
+                "대기일수": i - br_i,
+                "진입설명": "재돌파 후 첫 5일선 터치",
+            })
+            break
+
+    # E — first gate retest
+    for i in range(br_i + 1, end_i + 1):
+        r = d.iloc[i]
+        low, high = float(r["Low"]), float(r["High"])
+        if low <= gate <= high:
+            entries.append({
+                "진입전략": "E 관문 재확인",
+                "진입일": d.index[i].date(),
+                "진입가": gate,
+                "_entry_i": i,
+                "_eval_start_i": i + 1,
+                "대기일수": i - br_i,
+                "진입설명": "기존 구조관문 첫 재확인",
+            })
+            break
+
+    return entries
+
+
+def j2_evaluate_trade(d, setup, entry):
+    """
+    모든 진입법을 동일하게 비교하기 위해 진입 당일 OHLC는 평가하지 않는다.
+    진입 다음 거래일부터:
+      -3% 초기손절
+      +2% 도달 후 활성
+      2% 트레일
+      최대 5개 완전 거래일
+      비용은 기존 TOTAL_COST 사용
+    """
+    entry_i = int(entry["_entry_i"])
+    start_i = int(entry.get("_eval_start_i", entry_i + 1))
+    entry_price = float(entry["진입가"])
+    initial_stop = entry_price * 0.97
+
+    hit = {t: False for t in TARGETS}
+    mfe = 0.0
+    mae = 0.0
+    exit_i = None
+    exit_price = None
+    reason = None
+
+    if start_i >= len(d):
+        exit_i = entry_i
+        exit_price = float(d.iloc[entry_i]["Close"])
+        reason = "데이터종료"
+    else:
+        # 진입 후 완전한 5거래일 평가
+        last_i = min(len(d) - 1, start_i + HOLDING_DAYS - 1)
+        activated = False
+        highest_before_today = entry_price
+
+        for i in range(start_i, last_i + 1):
+            r = d.iloc[i]
+            high = float(r["High"])
+            low = float(r["Low"])
+
+            if activated:
+                trailing = highest_before_today * 0.98
+                active_stop = max(entry_price, trailing)
+            else:
+                active_stop = initial_stop
+
+            high_ret = (high / entry_price - 1) * 100
+            low_ret = (low / entry_price - 1) * 100
+
+            # 일봉 내 순서 불명확 시 stop 우선 — 보수적
+            if low <= active_stop:
+                mae = min(mae, (active_stop / entry_price - 1) * 100)
+                if high < entry_price * 1.02:
+                    mfe = max(mfe, max(0.0, high_ret))
+                exit_i = i
+                exit_price = active_stop
+                reason = "본전/트레일" if activated and active_stop >= entry_price else "손절"
+                break
+
+            mfe = max(mfe, high_ret)
+            mae = min(mae, low_ret)
+
+            for t in TARGETS:
+                if high >= entry_price * (1 + t/100):
+                    hit[t] = True
+
+            if high >= entry_price * 1.02:
+                activated = True
+
+            highest_before_today = max(highest_before_today, high)
+
+        if exit_i is None:
+            exit_i = last_i
+            exit_price = float(d.iloc[last_i]["Close"])
+            reason = "기간종료"
+
+    gross_ret = (exit_price / entry_price - 1) * 100
+    net_ret = gross_ret - TOTAL_COST
+
+    return {
+        "청산평가시작": "진입 다음거래일",
+        "초기손절가": round(initial_stop),
+        "청산일": d.index[exit_i].date(),
+        "청산가": round(exit_price),
+        "청산사유": reason,
+        "손절": str(reason).startswith("손절"),
+        "총수익률(%)": round(gross_ret, 2),
+        "거래비용(%)": round(TOTAL_COST, 2),
+        "순수익률(%)": round(net_ret, 2),
+        "MFE(%)": round(mfe, 2),
+        "MAE(%)": round(mae, 2),
+        "+3%": hit[3.0],
+        "+5%": hit[5.0],
+        "+7%": hit[7.0],
+        "+10%": hit[10.0],
+    }
+
+
+def j2_stats(df):
+    s = performance_stats(df)
+    s["손절률(%)"] = 0.0 if df.empty else round(
+        df["청산사유"].astype(str).str.startswith("손절").mean() * 100, 1
+    )
+    s["평균대기일"] = 0.0 if df.empty else round(
+        pd.to_numeric(df["대기일수"], errors="coerce").mean(), 2
+    )
+    return s
+
+
+def j2_compare(df):
+    rows = []
+    total_signals = int(df["신호ID"].nunique()) if not df.empty else 0
+
+    for mode in J2_ENTRY_MODES:
+        q = df[df["진입전략"] == mode].copy()
+        s = j2_stats(q)
+        rows.append({
+            "진입전략": mode,
+            "원신호": total_signals,
+            "체결건수": len(q),
+            "체결률(%)": round(len(q) / total_signals * 100, 1) if total_signals else 0.0,
+            **s,
+        })
+
+    out = pd.DataFrame(rows)
+    out = out.sort_values(
+        ["승률(%)", "신호", "평균수익률(%)", "ProfitFactor", "손절률(%)"],
+        ascending=[False, False, False, False, True]
+    ).reset_index(drop=True)
+    out.insert(0, "승률순위", range(1, len(out)+1))
+    return out
+
+
+def j2_split_by_signal(df, train_ratio=0.60):
+    ids = (
+        df[["신호ID","돌파일"]]
+        .drop_duplicates("신호ID")
+        .sort_values(["돌파일","신호ID"])
+        .reset_index(drop=True)
+    )
+    n = len(ids)
+    cut = max(1, min(n-1, int(n * train_ratio))) if n > 1 else 1
+    is_ids = set(ids.iloc[:cut]["신호ID"])
+    oos_ids = set(ids.iloc[cut:]["신호ID"])
+    return df[df["신호ID"].isin(is_ids)].copy(), df[df["신호ID"].isin(oos_ids)].copy()
+
+
+def j2_compare_split(df, train_ratio=0.60):
+    is_df, oos_df = j2_split_by_signal(df, train_ratio)
+    rows = []
+    for label, z in [("IS", is_df), ("OOS", oos_df)]:
+        c = j2_compare(z)
+        for _, r in c.iterrows():
+            rows.append({
+                "구간": label,
+                "진입전략": r["진입전략"],
+                "원신호": r["원신호"],
+                "체결건수": r["체결건수"],
+                "체결률(%)": r["체결률(%)"],
+                "승률(%)": r["승률(%)"],
+                "평균수익률(%)": r["평균수익률(%)"],
+                "중앙수익률(%)": r["중앙수익률(%)"],
+                "MDD(%)": r["MDD(%)"],
+                "최대연속손실": r["최대연속손실"],
+                "ProfitFactor": r["ProfitFactor"],
+                "누적복리수익률(%)": r["누적복리수익률(%)"],
+                "손절률(%)": r["손절률(%)"],
+                "평균대기일": r["평균대기일"],
+            })
+    return pd.DataFrame(rows), is_df, oos_df
+
+
+def j2_yearly(df):
+    if df.empty:
+        return pd.DataFrame()
+    q = df.copy()
+    q["연도"] = pd.to_datetime(q["진입일"]).dt.year
+    rows = []
+    for (mode, y), g in q.groupby(["진입전략","연도"]):
+        rows.append({
+            "진입전략": mode,
+            "연도": int(y),
+            **j2_stats(g)
+        })
+    return pd.DataFrame(rows)
+
+
+def j2_market(df):
+    if df.empty:
+        return pd.DataFrame()
+    rows = []
+    for (mode, market), g in df.groupby(["진입전략","시장"]):
+        rows.append({
+            "진입전략": mode,
+            "시장": market,
+            **j2_stats(g)
+        })
+    return pd.DataFrame(rows)
+
+
+def j2_pairwise_same_signal(df, mode1, mode2):
+    a = df[df["진입전략"] == mode1][
+        ["신호ID","순수익률(%)"]
+    ].rename(columns={"순수익률(%)":"수익1"})
+    b = df[df["진입전략"] == mode2][
+        ["신호ID","순수익률(%)"]
+    ].rename(columns={"순수익률(%)":"수익2"})
+    m = a.merge(b, on="신호ID", how="inner")
+    if m.empty:
+        return pd.DataFrame()
+    return pd.DataFrame([{
+        "비교": f"{mode1} vs {mode2}",
+        "공통체결신호": len(m),
+        "전략1승률(%)": round((m["수익1"] > 0).mean()*100, 1),
+        "전략2승률(%)": round((m["수익2"] > 0).mean()*100, 1),
+        "전략1평균(%)": round(m["수익1"].mean(), 2),
+        "전략2평균(%)": round(m["수익2"].mean(), 2),
+        "전략2-1 평균차(%p)": round((m["수익2"]-m["수익1"]).mean(), 2),
+        "전략2가 더 좋음(%)": round((m["수익2"] > m["수익1"]).mean()*100, 1),
+    }])
+
+
+# ============================================================
+# J2 v1.0 — entry timing decomposition
+# ============================================================
+
+J2_ENTRY_MODES = [
+    "A 돌파당일 종가",
+    "B 익일 시가",
+    "C 첫 2% 눌림",
+    "D 5일선 눌림",
+    "E 관문 재확인",
+]
+
+def j2_make_entries(d, setup, wait_days=5):
+    """
+    동일한 J1 구조 신호에서 진입 시점만 비교한다.
+
+    A: 재돌파일 종가
+    B: 다음 거래일 시가
+    C: 재돌파 후 최대 wait_days 이내, 돌파종가 대비 -2% 가격을
+       처음 터치한 날 해당 가격에 지정가 체결
+    D: 재돌파 후 최대 wait_days 이내, 당일 MA5가 일중 범위 안에
+       처음 들어온 날 MA5 가격에 체결
+    E: 재돌파 후 최대 wait_days 이내, 구조관문 가격이 일중 범위 안에
+       처음 들어온 날 관문 가격에 체결
+
+    C/D/E는 '가장 좋은 날'을 고르지 않고 첫 발생만 사용한다.
+    """
+    br_i = int(setup["_breakout_i"])
+    br = d.iloc[br_i]
+    br_close = float(br["Close"])
+    gate = float(setup["구조관문"])
+
+    entries = []
+
+    # A — close
+    entries.append({
+        "진입전략": "A 돌파당일 종가",
+        "진입일": d.index[br_i].date(),
+        "진입가": br_close,
+        "_entry_i": br_i,
+        "_eval_start_i": br_i + 1,
+        "대기일수": 0,
+        "진입설명": "관문 재돌파 당일 종가",
+    })
+
+    # B — next open
+    if br_i + 1 < len(d):
+        i = br_i + 1
+        entries.append({
+            "진입전략": "B 익일 시가",
+            "진입일": d.index[i].date(),
+            "진입가": float(d.iloc[i]["Open"]),
+            "_entry_i": i,
+            "_eval_start_i": i + 1,  # 동일 기준: 진입일 OHLC는 평가 제외
+            "대기일수": 1,
+            "진입설명": "관문 재돌파 다음 거래일 시가",
+        })
+
+    end_i = min(len(d) - 1, br_i + int(wait_days))
+
+    # C — first 2% pullback
+    target = br_close * 0.98
+    for i in range(br_i + 1, end_i + 1):
+        r = d.iloc[i]
+        low, high = float(r["Low"]), float(r["High"])
+        if low <= target <= high:
+            entries.append({
+                "진입전략": "C 첫 2% 눌림",
+                "진입일": d.index[i].date(),
+                "진입가": target,
+                "_entry_i": i,
+                "_eval_start_i": i + 1,
+                "대기일수": i - br_i,
+                "진입설명": "돌파종가 대비 -2% 첫 지정가 터치",
+            })
+            break
+
+    # D — first MA5 touch
+    for i in range(br_i + 1, end_i + 1):
+        r = d.iloc[i]
+        if pd.isna(r.get("MA5", None)):
+            continue
+        ma5 = float(r["MA5"])
+        low, high = float(r["Low"]), float(r["High"])
+        if low <= ma5 <= high:
+            entries.append({
+                "진입전략": "D 5일선 눌림",
+                "진입일": d.index[i].date(),
+                "진입가": ma5,
+                "_entry_i": i,
+                "_eval_start_i": i + 1,
+                "대기일수": i - br_i,
+                "진입설명": "재돌파 후 첫 5일선 터치",
+            })
+            break
+
+    # E — first gate retest
+    for i in range(br_i + 1, end_i + 1):
+        r = d.iloc[i]
+        low, high = float(r["Low"]), float(r["High"])
+        if low <= gate <= high:
+            entries.append({
+                "진입전략": "E 관문 재확인",
+                "진입일": d.index[i].date(),
+                "진입가": gate,
+                "_entry_i": i,
+                "_eval_start_i": i + 1,
+                "대기일수": i - br_i,
+                "진입설명": "기존 구조관문 첫 재확인",
+            })
+            break
+
+    return entries
+
+
+def j2_evaluate_trade(d, setup, entry):
+    """
+    모든 진입법을 동일하게 비교하기 위해 진입 당일 OHLC는 평가하지 않는다.
+    진입 다음 거래일부터:
+      -3% 초기손절
+      +2% 도달 후 활성
+      2% 트레일
+      최대 5개 완전 거래일
+      비용은 기존 TOTAL_COST 사용
+    """
+    entry_i = int(entry["_entry_i"])
+    start_i = int(entry.get("_eval_start_i", entry_i + 1))
+    entry_price = float(entry["진입가"])
+    initial_stop = entry_price * 0.97
+
+    hit = {t: False for t in TARGETS}
+    mfe = 0.0
+    mae = 0.0
+    exit_i = None
+    exit_price = None
+    reason = None
+
+    if start_i >= len(d):
+        exit_i = entry_i
+        exit_price = float(d.iloc[entry_i]["Close"])
+        reason = "데이터종료"
+    else:
+        # 진입 후 완전한 5거래일 평가
+        last_i = min(len(d) - 1, start_i + HOLDING_DAYS - 1)
+        activated = False
+        highest_before_today = entry_price
+
+        for i in range(start_i, last_i + 1):
+            r = d.iloc[i]
+            high = float(r["High"])
+            low = float(r["Low"])
+
+            if activated:
+                trailing = highest_before_today * 0.98
+                active_stop = max(entry_price, trailing)
+            else:
+                active_stop = initial_stop
+
+            high_ret = (high / entry_price - 1) * 100
+            low_ret = (low / entry_price - 1) * 100
+
+            # 일봉 내 순서 불명확 시 stop 우선 — 보수적
+            if low <= active_stop:
+                mae = min(mae, (active_stop / entry_price - 1) * 100)
+                if high < entry_price * 1.02:
+                    mfe = max(mfe, max(0.0, high_ret))
+                exit_i = i
+                exit_price = active_stop
+                reason = "본전/트레일" if activated and active_stop >= entry_price else "손절"
+                break
+
+            mfe = max(mfe, high_ret)
+            mae = min(mae, low_ret)
+
+            for t in TARGETS:
+                if high >= entry_price * (1 + t/100):
+                    hit[t] = True
+
+            if high >= entry_price * 1.02:
+                activated = True
+
+            highest_before_today = max(highest_before_today, high)
+
+        if exit_i is None:
+            exit_i = last_i
+            exit_price = float(d.iloc[last_i]["Close"])
+            reason = "기간종료"
+
+    gross_ret = (exit_price / entry_price - 1) * 100
+    net_ret = gross_ret - TOTAL_COST
+
+    return {
+        "청산평가시작": "진입 다음거래일",
+        "초기손절가": round(initial_stop),
+        "청산일": d.index[exit_i].date(),
+        "청산가": round(exit_price),
+        "청산사유": reason,
+        "손절": str(reason).startswith("손절"),
+        "총수익률(%)": round(gross_ret, 2),
+        "거래비용(%)": round(TOTAL_COST, 2),
+        "순수익률(%)": round(net_ret, 2),
+        "MFE(%)": round(mfe, 2),
+        "MAE(%)": round(mae, 2),
+        "+3%": hit[3.0],
+        "+5%": hit[5.0],
+        "+7%": hit[7.0],
+        "+10%": hit[10.0],
+    }
+
+
+def j2_stats(df):
+    s = performance_stats(df)
+    s["손절률(%)"] = 0.0 if df.empty else round(
+        df["청산사유"].astype(str).str.startswith("손절").mean() * 100, 1
+    )
+    s["평균대기일"] = 0.0 if df.empty else round(
+        pd.to_numeric(df["대기일수"], errors="coerce").mean(), 2
+    )
+    return s
+
+
+def j2_compare(df):
+    rows = []
+    total_signals = int(df["신호ID"].nunique()) if not df.empty else 0
+
+    for mode in J2_ENTRY_MODES:
+        q = df[df["진입전략"] == mode].copy()
+        s = j2_stats(q)
+        rows.append({
+            "진입전략": mode,
+            "원신호": total_signals,
+            "체결건수": len(q),
+            "체결률(%)": round(len(q) / total_signals * 100, 1) if total_signals else 0.0,
+            **s,
+        })
+
+    out = pd.DataFrame(rows)
+    out = out.sort_values(
+        ["승률(%)", "신호", "평균수익률(%)", "ProfitFactor", "손절률(%)"],
+        ascending=[False, False, False, False, True]
+    ).reset_index(drop=True)
+    out.insert(0, "승률순위", range(1, len(out)+1))
+    return out
+
+
+def j2_split_by_signal(df, train_ratio=0.60):
+    ids = (
+        df[["신호ID","돌파일"]]
+        .drop_duplicates("신호ID")
+        .sort_values(["돌파일","신호ID"])
+        .reset_index(drop=True)
+    )
+    n = len(ids)
+    cut = max(1, min(n-1, int(n * train_ratio))) if n > 1 else 1
+    is_ids = set(ids.iloc[:cut]["신호ID"])
+    oos_ids = set(ids.iloc[cut:]["신호ID"])
+    return df[df["신호ID"].isin(is_ids)].copy(), df[df["신호ID"].isin(oos_ids)].copy()
+
+
+def j2_compare_split(df, train_ratio=0.60):
+    is_df, oos_df = j2_split_by_signal(df, train_ratio)
+    rows = []
+    for label, z in [("IS", is_df), ("OOS", oos_df)]:
+        c = j2_compare(z)
+        for _, r in c.iterrows():
+            rows.append({
+                "구간": label,
+                "진입전략": r["진입전략"],
+                "원신호": r["원신호"],
+                "체결건수": r["체결건수"],
+                "체결률(%)": r["체결률(%)"],
+                "승률(%)": r["승률(%)"],
+                "평균수익률(%)": r["평균수익률(%)"],
+                "중앙수익률(%)": r["중앙수익률(%)"],
+                "MDD(%)": r["MDD(%)"],
+                "최대연속손실": r["최대연속손실"],
+                "ProfitFactor": r["ProfitFactor"],
+                "누적복리수익률(%)": r["누적복리수익률(%)"],
+                "손절률(%)": r["손절률(%)"],
+                "평균대기일": r["평균대기일"],
+            })
+    return pd.DataFrame(rows), is_df, oos_df
+
+
+def j2_yearly(df):
+    if df.empty:
+        return pd.DataFrame()
+    q = df.copy()
+    q["연도"] = pd.to_datetime(q["진입일"]).dt.year
+    rows = []
+    for (mode, y), g in q.groupby(["진입전략","연도"]):
+        rows.append({
+            "진입전략": mode,
+            "연도": int(y),
+            **j2_stats(g)
+        })
+    return pd.DataFrame(rows)
+
+
+def j2_market(df):
+    if df.empty:
+        return pd.DataFrame()
+    rows = []
+    for (mode, market), g in df.groupby(["진입전략","시장"]):
+        rows.append({
+            "진입전략": mode,
+            "시장": market,
+            **j2_stats(g)
+        })
+    return pd.DataFrame(rows)
+
+
+def j2_pairwise_same_signal(df, mode1, mode2):
+    a = df[df["진입전략"] == mode1][
+        ["신호ID","순수익률(%)"]
+    ].rename(columns={"순수익률(%)":"수익1"})
+    b = df[df["진입전략"] == mode2][
+        ["신호ID","순수익률(%)"]
+    ].rename(columns={"순수익률(%)":"수익2"})
+    m = a.merge(b, on="신호ID", how="inner")
+    if m.empty:
+        return pd.DataFrame()
+    return pd.DataFrame([{
+        "비교": f"{mode1} vs {mode2}",
+        "공통체결신호": len(m),
+        "전략1승률(%)": round((m["수익1"] > 0).mean()*100, 1),
+        "전략2승률(%)": round((m["수익2"] > 0).mean()*100, 1),
+        "전략1평균(%)": round(m["수익1"].mean(), 2),
+        "전략2평균(%)": round(m["수익2"].mean(), 2),
+        "전략2-1 평균차(%p)": round((m["수익2"]-m["수익1"]).mean(), 2),
+        "전략2가 더 좋음(%)": round((m["수익2"] > m["수익1"]).mean()*100, 1),
+    }])
+
+
 # ============================================================
 # UI
 # ============================================================
 with st.sidebar:
-    st.header("J1 v1.0 구조탐색 설정")
+    st.header("J2 v1.0 진입타이밍 설정")
     end_date = st.date_input("종료일", date(2026,7,31))
     years = st.selectbox("검증 기간",[3,4,5],index=2,format_func=lambda x:f"{x}년")
     per_market = st.selectbox("시장별 종목 수",[200,300,500],index=1)
-    train_ratio = st.selectbox("IS 비율",[0.60,0.70],index=0,format_func=lambda x:f"{int(x*100)}%")
-    min_is = st.selectbox("IS 최소 신호",[12,15,20],index=1)
-    run = st.button("▶ J1 구조탐색 실행",type="primary",use_container_width=True)
+    train_ratio = st.selectbox("시간순 IS 비율",[0.60,0.70],index=0,format_func=lambda x:f"{int(x*100)}%")
+    wait_days = st.selectbox("눌림 대기 최대일",[3,5,7],index=1)
+    run = st.button("▶ J2 진입타이밍 비교",type="primary",use_container_width=True)
 
 st.info(
-    "J1 v1.0은 기존 v14의 6배/7%/12%/6000억 필터를 사용하지 않습니다. "
-    "종산 자료에서 반복된 '큰 자금 유입 → 눌림/횡보 → 관문 재돌파' 구조를 새로 탐색합니다. "
-    "후보 선택은 시간순 앞 구간(IS)에서만 하고, 뒤 구간(OOS)은 선택 후 한 번만 평가합니다."
+    "J2에서는 J1의 종목선정/구조 신호를 수정하지 않습니다. "
+    "같은 신호에 대해 A=돌파당일 종가, B=익일 시가, C=첫 -2% 눌림, "
+    "D=첫 5일선 눌림, E=구조관문 첫 재확인을 비교합니다. "
+    "눌림형은 조건을 만족하지 않으면 미체결로 처리하며, 모든 전략은 진입 당일 OHLC를 청산평가에 사용하지 않습니다."
 )
 
 if run:
-    end_ts=pd.Timestamp(end_date)
-    cut=end_ts-pd.DateOffset(years=int(years))
-    start_ts=cut-pd.Timedelta(days=220)
-    fetch_end=end_ts+pd.Timedelta(days=45)
+    end_ts = pd.Timestamp(end_date)
+    cut = end_ts - pd.DateOffset(years=int(years))
+    start_ts = cut - pd.Timedelta(days=220)
+    fetch_end = end_ts + pd.Timedelta(days=60)
 
     try:
-        listing=stock_listing()
+        listing = stock_listing()
     except Exception as e:
         st.error(f"종목 목록 조회 실패: {type(e).__name__}")
-        st.exception(e); st.stop()
+        st.exception(e)
+        st.stop()
 
-    universes={}
+    universes = {}
     for market in ["KOSPI","KOSDAQ"]:
-        universes[market]=(
-            listing[listing["Market"]==market]
+        universes[market] = (
+            listing[listing["Market"] == market]
             .sort_values("Code")
             .head(int(per_market))
-            .copy().reset_index(drop=True)
+            .copy()
+            .reset_index(drop=True)
         )
 
-    total=sum(len(x) for x in universes.values())
-    done=0
-    progress=st.progress(0)
-    status=st.empty()
-    setups=[]
-    data_map={}
-    errors=[]
+    total = sum(len(x) for x in universes.values())
+    done = 0
+    progress = st.progress(0)
+    status = st.empty()
+    setups = []
+    data_map = {}
+    errors = []
 
-    for market,universe in universes.items():
-        for _,r in universe.iterrows():
-            done+=1
-            code0=str(r["Code"]).zfill(6); name=r["Name"]
-            status.info(f"{market} {done}/{total} · {name}")
+    for market, universe in universes.items():
+        for _, r in universe.iterrows():
+            done += 1
+            code0 = str(r["Code"]).zfill(6)
+            name = r["Name"]
+            status.info(f"{market} 데이터/신호 {done}/{total} · {name}")
+
             try:
-                d=load_data(code0,start_ts.strftime("%Y-%m-%d"),fetch_end.strftime("%Y-%m-%d"))
-                if d is None or d.empty or len(d)<160:
-                    progress.progress(done/max(total,1)); continue
-                found,prepared=j1_find_setups(d,code0,name,market,cut,end_ts)
-                data_map[(market,code0)]=prepared
+                d = load_data(
+                    code0,
+                    start_ts.strftime("%Y-%m-%d"),
+                    fetch_end.strftime("%Y-%m-%d")
+                )
+                if d is None or d.empty or len(d) < 160:
+                    progress.progress(done/max(total,1))
+                    continue
+
+                found, prepared = j1_find_setups(
+                    d, code0, name, market, cut, end_ts
+                )
+                data_map[(market, code0)] = prepared
                 if found:
                     setups.extend(found)
+
             except Exception as e:
-                errors.append(f"{market} {name}({code0}): {type(e).__name__}")
+                errors.append(
+                    f"{market} {name}({code0}): {type(e).__name__}"
+                )
+
             progress.progress(done/max(total,1))
             time.sleep(0.003)
 
-    progress.empty()
-
     if not setups:
-        status.warning("J1 구조 후보가 없습니다."); st.stop()
+        progress.empty()
+        status.warning("J1 구조 신호가 없습니다.")
+        st.stop()
 
-    setup_df=pd.DataFrame(setups).sort_values(["돌파일","코드"]).drop_duplicates(
-        subset=["코드","돌파일"],keep="first"
-    ).reset_index(drop=True)
+    setup_df = (
+        pd.DataFrame(setups)
+        .sort_values(["돌파일","코드"])
+        .drop_duplicates(subset=["코드","돌파일"], keep="first")
+        .reset_index(drop=True)
+    )
+    setup_df["신호ID"] = [
+        f"S{i+1:05d}" for i in range(len(setup_df))
+    ]
 
-    rows=[]
-    for _,setup in setup_df.iterrows():
-        key=(setup["시장"],str(setup["코드"]).zfill(6))
-        d=data_map.get(key)
+    rows = []
+
+    for pos, (_, setup) in enumerate(setup_df.iterrows(), 1):
+        key = (setup["시장"], str(setup["코드"]).zfill(6))
+        d = data_map.get(key)
         if d is None:
             continue
-        entry=j1_make_entry(d,setup)
-        ev=j1_evaluate_trade(d,setup,entry)
-        row=setup.drop(labels=["_b","_breakout_i"],errors="ignore").to_dict()
-        row.update({k:v for k,v in entry.items() if not k.startswith("_")})
-        row.update(ev)
-        rows.append(row)
 
-    trades=pd.DataFrame(rows).sort_values(["진입일","코드"]).reset_index(drop=True)
+        entries = j2_make_entries(
+            d, setup, wait_days=int(wait_days)
+        )
+
+        for entry in entries:
+            ev = j2_evaluate_trade(d, setup, entry)
+
+            row = setup.drop(
+                labels=["_b","_breakout_i"],
+                errors="ignore"
+            ).to_dict()
+
+            row.update({
+                k:v for k,v in entry.items()
+                if not k.startswith("_")
+            })
+            row.update(ev)
+            rows.append(row)
+
+        if pos % 20 == 0 or pos == len(setup_df):
+            status.info(
+                f"진입방식 평가 {pos}/{len(setup_df)} · 결과 {len(rows)}건"
+            )
+
+    progress.empty()
+
+    trades = pd.DataFrame(rows)
     if trades.empty:
-        status.warning("평가 가능한 J1 거래가 없습니다."); st.stop()
+        status.warning("평가 가능한 거래가 없습니다.")
+        st.stop()
 
     status.success(
-        f"완료 · KOSPI {len(universes['KOSPI'])} + KOSDAQ {len(universes['KOSDAQ'])}종목 · "
-        f"J1 넓은 구조 {len(trades)}건"
+        f"완료 · J1 원신호 {setup_df['신호ID'].nunique()}건 · "
+        f"진입방식별 체결 결과 {len(trades)}건"
     )
 
-    split_i=max(1,min(len(trades)-1,int(len(trades)*float(train_ratio))))
-    is_df=trades.iloc[:split_i].copy()
-    oos_df=trades.iloc[split_i:].copy()
-    oos_start=oos_df.iloc[0]["진입일"] if not oos_df.empty else None
+    # ========================================================
+    # ① 전체
+    # ========================================================
+    st.subheader("① 전체 진입타이밍 비교")
+    overall = j2_compare(trades)
+    st.dataframe(overall, use_container_width=True, hide_index=True)
 
-    st.subheader("① 전체 넓은 구조 베이스라인")
-    baseline=pd.DataFrame([
-        {"구간":"전체",**j1_stats(trades)},
-        {"구간":"IS",**j1_stats(is_df)},
-        {"구간":"OOS",**j1_stats(oos_df)},
-    ])
-    st.dataframe(baseline,use_container_width=True,hide_index=True)
+    top = overall.iloc[0]
+    st.success(
+        f'전체 승률 1위: **{top["진입전략"]}** · '
+        f'승률 {top["승률(%)"]:.1f}% · 체결 {int(top["체결건수"])}건 '
+        f'({top["체결률(%)"]:.1f}%) · 평균 {top["평균수익률(%)"]:.2f}% · '
+        f'PF {("-" if pd.isna(top["ProfitFactor"]) else f"{top["ProfitFactor"]:.2f}")}'
+    )
 
-    st.subheader("② IS에서만 구조 후보 비교")
-    is_rank=j1_compare_on_is(is_df,int(min_is))
-    st.dataframe(is_rank,use_container_width=True,hide_index=True)
+    # ========================================================
+    # ② IS/OOS
+    # ========================================================
+    st.subheader("② 동일 신호 시간순 IS/OOS")
+    split_df, is_df, oos_df = j2_compare_split(
+        trades, float(train_ratio)
+    )
+    st.dataframe(split_df, use_container_width=True, hide_index=True)
 
-    passed=is_rank[is_rank["IS합격"]==True].copy()
-
-    if passed.empty:
-        st.warning(
-            "IS 합격 후보가 없습니다. 조건을 억지로 완화하지 않습니다. "
-            "이 경우 J1 v1.0 구조가 승률 우위를 만들지 못한 것으로 판단합니다."
-        )
-        chosen_name=None
-        chosen_is=pd.DataFrame()
-        chosen_oos=pd.DataFrame()
-        chosen_all=pd.DataFrame()
-    else:
-        chosen_name=str(passed.iloc[0]["후보"])
-        chosen_is=j1_apply_candidate(is_df,chosen_name)
-        chosen_oos=j1_apply_candidate(oos_df,chosen_name)
-        chosen_all=j1_apply_candidate(trades,chosen_name)
-
-        st.success(
-            f"IS 선택 후보: **{chosen_name}** · "
-            f"IS 승률 {j1_stats(chosen_is)['승률(%)']:.1f}% / "
-            f"{j1_stats(chosen_is)['신호']}건. "
-            f"OOS 시작일: {oos_start}"
-        )
-
-        st.subheader("③ 선택 후보 OOS 검증")
-        eval_df=pd.DataFrame([
-            {"구간":"IS",**j1_stats(chosen_is)},
-            {"구간":"OOS",**j1_stats(chosen_oos)},
-            {"구간":"전체 참고",**j1_stats(chosen_all)},
-        ])
-        st.dataframe(eval_df,use_container_width=True,hide_index=True)
-
-        o=j1_stats(chosen_oos)
-        oos_pass=(
-            o["신호"]>=8
-            and o["승률(%)"]>=50.0
-            and o["평균수익률(%)"]>0
-            and o["ProfitFactor"] is not None
-            and o["ProfitFactor"]>=1.5
-        )
-        if oos_pass:
-            st.success(
-                "✅ 1차 OOS 통과. 아직 최종 확정이 아니라, 다음 버전에서 "
-                "완전히 미사용 종목군으로 독립검증할 가치가 있습니다."
-            )
-        else:
-            st.warning(
-                "❌ OOS 기준 미충족. 이 구조를 숫자 미세조정으로 살리지 말고 "
-                "실패 사례의 구조 차이를 다시 분석하는 것이 맞습니다."
-            )
-
-        st.subheader("④ 선택 후보 시장별 성과")
-        market_df=j1_market_stats(chosen_all)
-        st.dataframe(market_df,use_container_width=True,hide_index=True)
-
-        st.subheader("⑤ 선택 후보 연도별 성과")
-        year_df=j1_yearly(chosen_all)
-        st.dataframe(year_df,use_container_width=True,hide_index=True)
-
-        st.subheader("⑥ 아웃라이어 스트레스")
-        stress_df=j1_stress(chosen_all)
-        st.dataframe(stress_df,use_container_width=True,hide_index=True)
-
-        st.subheader("⑦ 선택 후보 실제 거래")
-        show_cols=[
-            "시장","종목명","코드","기준봉일","기준봉상승률(%)",
-            "기준봉거래대금(억)","기준봉거래대금20배수",
-            "구조기간","눌림깊이(%)","기준봉저가유지(%)",
-            "구조거래량수축","돌파일","돌파거래량vs구조평균",
-            "돌파봉종가위치(%)","전고점60이격(%)",
-            "진입일","진입가","순수익률(%)","MFE(%)","MAE(%)","청산사유"
+    # IS에서 승률 1위 선택, OOS에서 확인
+    is_rank = split_df[split_df["구간"]=="IS"].sort_values(
+        ["승률(%)","체결건수","평균수익률(%)","ProfitFactor"],
+        ascending=[False,False,False,False]
+    )
+    if not is_rank.empty:
+        chosen = str(is_rank.iloc[0]["진입전략"])
+        oos_chosen = split_df[
+            (split_df["구간"]=="OOS")
+            & (split_df["진입전략"]==chosen)
         ]
-        st.dataframe(
-            chosen_all[[c for c in show_cols if c in chosen_all.columns]]
-            .sort_values("진입일",ascending=False),
-            use_container_width=True,hide_index=True
-        )
 
-    st.subheader("⑧ J1 v1.0 전체 Excel")
-    settings=pd.DataFrame([
-        {"항목":"전략가설","값":"큰 자금유입 → 눌림/횡보 → 관문 종가 재돌파"},
-        {"항목":"진입","값":"재돌파일 종가"},
-        {"항목":"청산","값":"-3% 손절 / +2% 활성 / 2% 트레일 / 다음날부터 / 최대5거래일 / 비용0.40%"},
-        {"항목":"후보선택","값":"시간순 IS에서만 선택"},
-        {"항목":"OOS","값":f"{int((1-float(train_ratio))*100)}% / 선택 후 평가"},
-        {"항목":"승률우선 합격","값":"IS 승률>=50%, 평균>0, PF>=1.5, 최소신호 충족"},
-        {"항목":"기존v14필터","값":"사용 안 함"},
+        st.info(f"IS 승률 1위 선택: **{chosen}**")
+
+        if not oos_chosen.empty:
+            rr = oos_chosen.iloc[0]
+            if (
+                rr["체결건수"] >= 20
+                and rr["승률(%)"] >= 50.0
+                and rr["평균수익률(%)"] > 0
+                and pd.notna(rr["ProfitFactor"])
+                and rr["ProfitFactor"] >= 1.5
+            ):
+                st.success(
+                    f"✅ OOS 1차 통과 · {chosen}: "
+                    f"승률 {rr['승률(%)']:.1f}% / {int(rr['체결건수'])}건 / "
+                    f"평균 {rr['평균수익률(%)']:.2f}% / PF {rr['ProfitFactor']:.2f}"
+                )
+            else:
+                st.warning(
+                    f"❌ OOS 기준 미충족 · {chosen}: "
+                    f"승률 {rr['승률(%)']:.1f}% / {int(rr['체결건수'])}건 / "
+                    f"평균 {rr['평균수익률(%)']:.2f}%"
+                )
+
+    # ========================================================
+    # ③ fill / wait diagnostic
+    # ========================================================
+    st.subheader("③ 눌림형 체결률·대기일 진단")
+    fill_cols = [
+        "진입전략","원신호","체결건수","체결률(%)",
+        "평균대기일","승률(%)","평균수익률(%)","손절률(%)"
+    ]
+    st.dataframe(
+        overall[[c for c in fill_cols if c in overall.columns]],
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ========================================================
+    # ④ same-signal direct comparisons
+    # ========================================================
+    st.subheader("④ 동일 신호 직접 비교")
+    pair_frames = []
+    for mode in J2_ENTRY_MODES[1:]:
+        z = j2_pairwise_same_signal(
+            trades, "A 돌파당일 종가", mode
+        )
+        if not z.empty:
+            pair_frames.append(z)
+    pair_df = (
+        pd.concat(pair_frames, ignore_index=True)
+        if pair_frames else pd.DataFrame()
+    )
+    st.dataframe(pair_df, use_container_width=True, hide_index=True)
+
+    # ========================================================
+    # ⑤ market
+    # ========================================================
+    st.subheader("⑤ 시장별 성과")
+    market_df = j2_market(trades)
+    st.dataframe(market_df, use_container_width=True, hide_index=True)
+
+    # ========================================================
+    # ⑥ yearly
+    # ========================================================
+    st.subheader("⑥ 연도별 성과")
+    year_df = j2_yearly(trades)
+    st.dataframe(year_df, use_container_width=True, hide_index=True)
+
+    # ========================================================
+    # ⑦ actual trades
+    # ========================================================
+    st.subheader("⑦ 거래별 진입결과")
+    show_cols = [
+        "신호ID","시장","종목명","코드","기준봉일","돌파일",
+        "구조관문","진입전략","진입일","대기일수","진입가",
+        "순수익률(%)","MFE(%)","MAE(%)","청산사유"
+    ]
+    st.dataframe(
+        trades[[c for c in show_cols if c in trades.columns]]
+        .sort_values(["신호ID","진입전략"]),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ========================================================
+    # ⑧ Excel
+    # ========================================================
+    st.subheader("⑧ J2 전체 결과 Excel")
+
+    settings = pd.DataFrame([
+        {"항목":"원신호","값":"J1 v1.0 넓은 구조 신호 그대로"},
+        {"항목":"A","값":"재돌파일 종가"},
+        {"항목":"B","값":"익일 시가"},
+        {"항목":"C","값":"돌파종가 대비 -2% 첫 터치 / 최대 대기일 내"},
+        {"항목":"D","값":"첫 5일선 터치 / 최대 대기일 내"},
+        {"항목":"E","값":"구조관문 첫 재확인 / 최대 대기일 내"},
+        {"항목":"눌림 최대대기","값":f"{int(wait_days)}거래일"},
+        {"항목":"청산","값":"진입 다음날부터 -3% 손절 / +2% 활성 / 2% 트레일 / 5거래일 / 비용0.40%"},
+        {"항목":"비교원칙","값":"종목선정 고정, 진입시점만 비교"},
+        {"항목":"IS/OOS","값":f"시간순 {int(float(train_ratio)*100)}/{int((1-float(train_ratio))*100)}"},
     ])
 
-    sheets={
-        "00_설정":settings,
-        "01_베이스라인":baseline,
-        "02_IS후보비교":is_rank,
-        "03_전체구조거래":trades,
-        "04_IS원자료":is_df,
-        "05_OOS원자료":oos_df,
-    }
+    excel_bytes = build_excel({
+        "00_설정": settings,
+        "01_전체비교": overall,
+        "02_IS_OOS": split_df,
+        "03_동일신호직접비교": pair_df,
+        "04_시장별": market_df,
+        "05_연도별": year_df,
+        "06_원신호": setup_df.drop(columns=["_b","_breakout_i"], errors="ignore"),
+        "07_전체진입결과": trades,
+        "08_IS거래": is_df,
+        "09_OOS거래": oos_df,
+    })
 
-    if chosen_name is not None:
-        sheets.update({
-            "06_선택후보_IS":chosen_is,
-            "07_선택후보_OOS":chosen_oos,
-            "08_선택후보_전체":chosen_all,
-            "09_시장별":market_df,
-            "10_연도별":year_df,
-            "11_아웃라이어":stress_df,
-        })
-
-    excel_bytes=build_excel(sheets)
     st.download_button(
-        "📦 J1 v1.0 구조탐색 전체 Excel 다운로드",
+        "📦 J2 v1.0 진입타이밍 분해검증 Excel 다운로드",
         data=excel_bytes,
-        file_name="swing_J1_v1_0_structure_research.xlsx",
+        file_name="swing_J2_v1_0_entry_timing_comparison.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
@@ -3685,5 +4424,6 @@ if run:
             st.write(errors)
 
 st.caption(
-    "J1 v1.0은 구조 가설 탐색판입니다. OOS 결과를 본 뒤 같은 OOS에서 컷을 다시 조정하지 않습니다."
+    "J2 v1.0은 종목선정이 아니라 진입시점 검증판입니다. "
+    "OOS 결과를 본 뒤 같은 OOS에 맞춰 -2%나 대기일을 다시 조정하지 않습니다."
 )
