@@ -5,8 +5,8 @@ import time
 from datetime import date
 from io import BytesIO
 
-st.set_page_config(page_title="J2 v1.0 진입타이밍 분해검증", layout="wide")
-st.title("🎯 J2 v1.0 · 동일 J1 신호의 진입타이밍 분해검증")
+st.set_page_config(page_title="J2 v1.1 진입타이밍 분해검증 수정판", layout="wide")
+st.title("🎯 J2 v1.1 · 동일 J1 신호의 진입타이밍 분해검증")
 st.caption("종목선정/J1 구조 고정 · 돌파종가 vs 익일시가 vs 첫눌림 vs 5일선눌림 vs 관문재확인 · 승률 우선")
 
 # ============================================================
@@ -3797,6 +3797,16 @@ J2_ENTRY_MODES = [
     "E 관문 재확인",
 ]
 
+
+def j2_valid_price(x):
+    """실제 체결가격으로 사용할 수 있는 유한 양수인지 확인."""
+    try:
+        v = float(x)
+        return np.isfinite(v) and v > 0
+    except Exception:
+        return False
+
+
 def j2_make_entries(d, setup, wait_days=5):
     """
     동일한 J1 구조 신호에서 진입 시점만 비교한다.
@@ -3814,41 +3824,48 @@ def j2_make_entries(d, setup, wait_days=5):
     """
     br_i = int(setup["_breakout_i"])
     br = d.iloc[br_i]
-    br_close = float(br["Close"])
-    gate = float(setup["구조관문"])
+    br_close = float(br["Close"]) if j2_valid_price(br["Close"]) else None
+    gate = float(setup["구조관문"]) if j2_valid_price(setup["구조관문"]) else None
 
     entries = []
 
     # A — close
-    entries.append({
-        "진입전략": "A 돌파당일 종가",
-        "진입일": d.index[br_i].date(),
-        "진입가": br_close,
-        "_entry_i": br_i,
-        "_eval_start_i": br_i + 1,
-        "대기일수": 0,
-        "진입설명": "관문 재돌파 당일 종가",
-    })
+    if br_close is not None:
+        entries.append({
+            "진입전략": "A 돌파당일 종가",
+            "진입일": d.index[br_i].date(),
+            "진입가": br_close,
+            "_entry_i": br_i,
+            "_eval_start_i": br_i + 1,
+            "대기일수": 0,
+            "진입설명": "관문 재돌파 당일 종가",
+        })
 
     # B — next open
     if br_i + 1 < len(d):
         i = br_i + 1
-        entries.append({
-            "진입전략": "B 익일 시가",
-            "진입일": d.index[i].date(),
-            "진입가": float(d.iloc[i]["Open"]),
-            "_entry_i": i,
-            "_eval_start_i": i + 1,  # 동일 기준: 진입일 OHLC는 평가 제외
-            "대기일수": 1,
-            "진입설명": "관문 재돌파 다음 거래일 시가",
-        })
+        next_open = d.iloc[i]["Open"]
+        if j2_valid_price(next_open):
+            entries.append({
+                "진입전략": "B 익일 시가",
+                "진입일": d.index[i].date(),
+                "진입가": float(next_open),
+                "_entry_i": i,
+                "_eval_start_i": i + 1,  # 동일 기준: 진입일 OHLC는 평가 제외
+                "대기일수": 1,
+                "진입설명": "관문 재돌파 다음 거래일 시가",
+            })
 
     end_i = min(len(d) - 1, br_i + int(wait_days))
 
     # C — first 2% pullback
-    target = br_close * 0.98
+    target = br_close * 0.98 if br_close is not None else None
     for i in range(br_i + 1, end_i + 1):
+        if target is None:
+            break
         r = d.iloc[i]
+        if not (j2_valid_price(r["Low"]) and j2_valid_price(r["High"])):
+            continue
         low, high = float(r["Low"]), float(r["High"])
         if low <= target <= high:
             entries.append({
@@ -3865,7 +3882,9 @@ def j2_make_entries(d, setup, wait_days=5):
     # D — first MA5 touch
     for i in range(br_i + 1, end_i + 1):
         r = d.iloc[i]
-        if pd.isna(r.get("MA5", None)):
+        if pd.isna(r.get("MA5", None)) or not j2_valid_price(r.get("MA5", None)):
+            continue
+        if not (j2_valid_price(r["Low"]) and j2_valid_price(r["High"])):
             continue
         ma5 = float(r["MA5"])
         low, high = float(r["Low"]), float(r["High"])
@@ -3883,7 +3902,11 @@ def j2_make_entries(d, setup, wait_days=5):
 
     # E — first gate retest
     for i in range(br_i + 1, end_i + 1):
+        if gate is None:
+            break
         r = d.iloc[i]
+        if not (j2_valid_price(r["Low"]) and j2_valid_price(r["High"])):
+            continue
         low, high = float(r["Low"]), float(r["High"])
         if low <= gate <= high:
             entries.append({
@@ -3912,6 +3935,10 @@ def j2_evaluate_trade(d, setup, entry):
     """
     entry_i = int(entry["_entry_i"])
     start_i = int(entry.get("_eval_start_i", entry_i + 1))
+
+    if not j2_valid_price(entry.get("진입가", None)):
+        return None
+
     entry_price = float(entry["진입가"])
     initial_stop = entry_price * 0.97
 
@@ -3924,7 +3951,10 @@ def j2_evaluate_trade(d, setup, entry):
 
     if start_i >= len(d):
         exit_i = entry_i
-        exit_price = float(d.iloc[entry_i]["Close"])
+        fallback_close = d.iloc[entry_i]["Close"]
+        if not j2_valid_price(fallback_close):
+            return None
+        exit_price = float(fallback_close)
         reason = "데이터종료"
     else:
         # 진입 후 완전한 5거래일 평가
@@ -3934,6 +3964,10 @@ def j2_evaluate_trade(d, setup, entry):
 
         for i in range(start_i, last_i + 1):
             r = d.iloc[i]
+
+            if not (j2_valid_price(r["High"]) and j2_valid_price(r["Low"])):
+                continue
+
             high = float(r["High"])
             low = float(r["Low"])
 
@@ -3969,9 +4003,22 @@ def j2_evaluate_trade(d, setup, entry):
             highest_before_today = max(highest_before_today, high)
 
         if exit_i is None:
-            exit_i = last_i
-            exit_price = float(d.iloc[last_i]["Close"])
+            # 마지막 평가일 종가가 비정상이면 뒤에서부터 유효 종가 탐색
+            valid_exit_i = None
+            for j in range(last_i, start_i - 1, -1):
+                if j2_valid_price(d.iloc[j]["Close"]):
+                    valid_exit_i = j
+                    break
+
+            if valid_exit_i is None:
+                return None
+
+            exit_i = valid_exit_i
+            exit_price = float(d.iloc[valid_exit_i]["Close"])
             reason = "기간종료"
+
+    if not j2_valid_price(exit_price):
+        return None
 
     gross_ret = (exit_price / entry_price - 1) * 100
     net_ret = gross_ret - TOTAL_COST
@@ -4123,7 +4170,7 @@ def j2_pairwise_same_signal(df, mode1, mode2):
 # UI
 # ============================================================
 with st.sidebar:
-    st.header("J2 v1.0 진입타이밍 설정")
+    st.header("J2 v1.1 진입타이밍 설정")
     end_date = st.date_input("종료일", date(2026,7,31))
     years = st.selectbox("검증 기간",[3,4,5],index=2,format_func=lambda x:f"{x}년")
     per_market = st.selectbox("시장별 종목 수",[200,300,500],index=1)
@@ -4135,7 +4182,8 @@ st.info(
     "J2에서는 J1의 종목선정/구조 신호를 수정하지 않습니다. "
     "같은 신호에 대해 A=돌파당일 종가, B=익일 시가, C=첫 -2% 눌림, "
     "D=첫 5일선 눌림, E=구조관문 첫 재확인을 비교합니다. "
-    "눌림형은 조건을 만족하지 않으면 미체결로 처리하며, 모든 전략은 진입 당일 OHLC를 청산평가에 사용하지 않습니다."
+    "눌림형은 조건을 만족하지 않으면 미체결로 처리하며, 모든 전략은 진입 당일 OHLC를 청산평가에 사용하지 않습니다. "
+    "가격이 0원/NaN/비정상인 데이터는 체결에서 자동 제외합니다."
 )
 
 if run:
@@ -4230,6 +4278,9 @@ if run:
 
         for entry in entries:
             ev = j2_evaluate_trade(d, setup, entry)
+
+            if ev is None:
+                continue
 
             row = setup.drop(
                 labels=["_b","_breakout_i"],
@@ -4412,9 +4463,9 @@ if run:
     })
 
     st.download_button(
-        "📦 J2 v1.0 진입타이밍 분해검증 Excel 다운로드",
+        "📦 J2 v1.1 진입타이밍 분해검증 수정판 Excel 다운로드",
         data=excel_bytes,
-        file_name="swing_J2_v1_0_entry_timing_comparison.xlsx",
+        file_name="swing_J2_v1_1_entry_timing_comparison_fixed.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
@@ -4424,6 +4475,6 @@ if run:
             st.write(errors)
 
 st.caption(
-    "J2 v1.0은 종목선정이 아니라 진입시점 검증판입니다. "
+    "J2 v1.1은 종목선정이 아니라 진입시점 검증판입니다. "
     "OOS 결과를 본 뒤 같은 OOS에 맞춰 -2%나 대기일을 다시 조정하지 않습니다."
 )
