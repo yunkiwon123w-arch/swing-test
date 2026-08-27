@@ -5,9 +5,9 @@ import time
 from datetime import date
 from io import BytesIO
 
-st.set_page_config(page_title="단기스윙 v14.2 최종 독립검증", layout="wide")
-st.title("🧪 단기스윙 v14.2 · A+B 복합형 최종 독립검증")
-st.caption("A+B 복합형 조건 완전 동결 · 미사용 KOSPI + KOSDAQ 별도 독립검증 · 조건 재조정 금지")
+st.set_page_config(page_title="J1 v1.0 종산형 구조탐색", layout="wide")
+st.title("🧭 J1 v1.0 · 자금유입→눌림/횡보→재돌파 구조탐색")
+st.caption("종산 자료에서 반복된 구조 가설을 정량화 · KOSPI+KOSDAQ · IS에서만 후보선택 · OOS 검증")
 
 # ============================================================
 # 완전 동결된 전략값
@@ -2879,698 +2879,811 @@ def v142_pass_judgement(stats):
     )
 
 
+
+# ============================================================
+# J1 v1.0 — structure research
+# ============================================================
+
+def j1_find_setups(d, code, name, market, cut, end):
+    """
+    가설 구조:
+      1) 최근 120일 평균 대비 큰 거래대금/거래량 + 강한 상승 = 자금유입봉
+      2) 이후 3~20거래일 눌림/횡보, 거래량 감소, 자금유입봉 저가 훼손 제한
+      3) 눌림 구간 상단(관문)을 종가로 재돌파 + 강한 종가
+      4) 돌파일 종가 진입. 청산은 기존 v13.1과 동일.
+    이 함수는 넓은 후보군을 만들고, 구체 컷은 IS에서만 비교한다.
+    """
+    d = add_indicators(d).copy()
+    d["AVG_VALUE20"] = d["거래대금"].shift(1).rolling(20).mean()
+    d["AVG_VALUE60"] = d["거래대금"].shift(1).rolling(60).mean()
+    d["AVG_VOL60"] = d["Volume"].shift(1).rolling(60).mean()
+    d["HH120"] = d["High"].shift(1).rolling(120).max()
+
+    rows = []
+
+    for b in range(120, len(d) - 4):
+        if d.index[b] < cut or d.index[b] > end:
+            continue
+
+        x = d.iloc[b]
+        if any(pd.isna(x[c]) for c in ["AVG_VALUE20","AVG_VALUE60","AVG_VOL20","MA5","MA20"]):
+            continue
+
+        base_value_eok = float(x["거래대금"]) / 1e8
+        value_mult20 = float(x["거래대금"]) / max(float(x["AVG_VALUE20"]), 1.0)
+        value_mult60 = float(x["거래대금"]) / max(float(x["AVG_VALUE60"]), 1.0)
+        vol_mult20 = float(x["Volume"]) / max(float(x["AVG_VOL20"]), 1.0)
+        base_ret = float(x["등락률"])
+
+        # 넓은 '커밍아웃' 후보. 최종 컷이 아니라 탐색용 모집단.
+        if not (
+            base_ret >= 7.0
+            and base_value_eok >= 500.0
+            and value_mult20 >= 2.0
+            and vol_mult20 >= 1.5
+            and float(x["Close"]) > float(x["MA5"])
+        ):
+            continue
+
+        # 자금유입 후 3~20일 동안 형성된 구조에서 첫 '관문 종가돌파' 탐색
+        for br_i in range(b + 3, min(b + 21, len(d))):
+            if d.index[br_i] > end:
+                break
+
+            br = d.iloc[br_i]
+            cons = d.iloc[b+1:br_i]
+
+            if len(cons) < 2:
+                continue
+
+            gate = float(cons["High"].max())
+            cons_low = float(cons["Low"].min())
+            cons_avg_vol = float(cons["Volume"].mean())
+            cons_avg_value = float(cons["거래대금"].mean())
+
+            # 종가로 관문을 실제 회복/돌파해야 함
+            if float(br["Close"]) <= gate:
+                continue
+
+            rng = max(float(br["High"]) - float(br["Low"]), 1.0)
+            close_pos = (float(br["Close"]) - float(br["Low"])) / rng * 100.0
+            bullish = float(br["Close"]) > float(br["Open"])
+
+            # 넓은 재돌파 후보
+            if not (bullish and close_pos >= 55.0):
+                continue
+
+            prior60 = d["High"].iloc[max(0,b-60):b].max()
+            prior120 = d["High"].iloc[max(0,b-120):b].max()
+
+            base_close = float(x["Close"])
+            base_low = float(x["Low"])
+            base_high = float(x["High"])
+            br_close = float(br["Close"])
+
+            pull_from_base = (cons_low / base_close - 1) * 100.0
+            base_low_hold = (cons_low / base_low - 1) * 100.0
+            vol_contract = cons_avg_vol / max(float(x["Volume"]),1.0)
+            value_contract = cons_avg_value / max(float(x["거래대금"]),1.0)
+            br_vol_vs_cons = float(br["Volume"]) / max(cons_avg_vol,1.0)
+            br_value_vs_cons = float(br["거래대금"]) / max(cons_avg_value,1.0)
+            br_value_eok = float(br["거래대금"]) / 1e8
+            ma5_gap = (br_close / float(br["MA5"]) - 1) * 100 if pd.notna(br["MA5"]) else None
+            ma20_gap = (br_close / float(br["MA20"]) - 1) * 100 if pd.notna(br["MA20"]) else None
+            ma20_slope = float(br["MA20기울기5일(%)"]) if pd.notna(br["MA20기울기5일(%)"]) else None
+            prior60_gap = (br_close / float(prior60) - 1) * 100 if pd.notna(prior60) and prior60 else None
+            prior120_gap = (br_close / float(prior120) - 1) * 100 if pd.notna(prior120) and prior120 else None
+            base_to_break = (br_close / base_close - 1) * 100.0
+            gate_break = (br_close / gate - 1) * 100.0
+
+            rows.append({
+                "시장":market,
+                "종목명":name,
+                "코드":str(code).zfill(6),
+                "기준봉일":d.index[b].date(),
+                "기준봉상승률(%)":round(base_ret,2),
+                "기준봉거래대금(억)":round(base_value_eok,1),
+                "기준봉거래대금20배수":round(value_mult20,2),
+                "기준봉거래대금60배수":round(value_mult60,2),
+                "기준봉거래량20배수":round(vol_mult20,2),
+                "기준봉고가":round(base_high),
+                "기준봉저가":round(base_low),
+                "기준봉종가":round(base_close),
+                "구조기간":int(br_i-b-1),
+                "구조관문":round(gate),
+                "구조최저가":round(cons_low),
+                "눌림깊이(%)":round(pull_from_base,2),
+                "기준봉저가유지(%)":round(base_low_hold,2),
+                "구조거래량수축":round(vol_contract,3),
+                "구조거래대금수축":round(value_contract,3),
+                "돌파일":d.index[br_i].date(),
+                "돌파종가":round(br_close),
+                "관문돌파폭(%)":round(gate_break,2),
+                "기준봉대비돌파종가(%)":round(base_to_break,2),
+                "돌파봉등락률(%)":round(float(br["등락률"]),2),
+                "돌파봉종가위치(%)":round(close_pos,2),
+                "돌파거래대금(억)":round(br_value_eok,1),
+                "돌파거래량vs구조평균":round(br_vol_vs_cons,2),
+                "돌파거래대금vs구조평균":round(br_value_vs_cons,2),
+                "진입5일선이격(%)":round(ma5_gap,2) if ma5_gap is not None else None,
+                "진입20일선이격(%)":round(ma20_gap,2) if ma20_gap is not None else None,
+                "20일선5일기울기(%)":round(ma20_slope,2) if ma20_slope is not None else None,
+                "전고점60이격(%)":round(prior60_gap,2) if prior60_gap is not None else None,
+                "전고점120이격(%)":round(prior120_gap,2) if prior120_gap is not None else None,
+                "_b":b,
+                "_breakout_i":br_i,
+            })
+            break
+
+    return rows, d
+
+
+def j1_make_entry(d, setup):
+    i = int(setup["_breakout_i"])
+    br = d.iloc[i]
+    return {
+        "진입전략":"J1 재돌파 종가진입",
+        "진입일":d.index[i].date(),
+        "진입가":float(br["Close"]),
+        "_entry_i":i,
+        "진입설명":"자금유입봉→눌림/횡보→관문 종가 재돌파",
+    }
+
+
+def j1_evaluate_trade(d, setup, entry):
+    # v13.1의 종가진입 청산 로직 재사용:
+    # 진입 당일 OHLC 미사용, 다음 거래일부터 -3% / +2% 활성 / 2% 트레일 / 5일
+    return v13_evaluate_trade(d, setup, entry)
+
+
+def j1_stats(df):
+    s = performance_stats(df)
+    s["손절률(%)"] = 0.0 if df.empty else round(
+        df["청산사유"].astype(str).str.startswith("손절").mean()*100, 1
+    )
+    return s
+
+
+def j1_rule_catalog():
+    # 종산 자료에서 반복된 개념을 '넓은 몇 단계'로만 비교.
+    # 숫자 미세조정은 하지 않는다.
+    return {
+        "R1 자금유입강": lambda d:
+            (d["기준봉거래대금20배수"] >= 4.0)
+            & (d["기준봉거래대금(억)"] >= 1000.0),
+
+        "R2 눌림수축": lambda d:
+            (d["구조거래량수축"] <= 0.55)
+            & (d["기준봉저가유지(%)"] >= -3.0),
+
+        "R3 추세유지": lambda d:
+            (d["진입20일선이격(%)"] >= 0.0)
+            & (d["20일선5일기울기(%)"] > 0.0),
+
+        "R4 전고점근접": lambda d:
+            (d["전고점60이격(%)"] >= -3.0),
+
+        "R5 재돌파재점화": lambda d:
+            (d["돌파거래량vs구조평균"] >= 1.5)
+            & (d["돌파봉종가위치(%)"] >= 70.0),
+
+        "R6 3~10일구조": lambda d:
+            d["구조기간"].between(3,10),
+    }
+
+
+def j1_candidate_masks(df):
+    r = j1_rule_catalog()
+    specs = [
+        ("J0 넓은 구조", []),
+        ("J1 자금유입+수축", ["R1 자금유입강","R2 눌림수축"]),
+        ("J2 자금유입+추세", ["R1 자금유입강","R3 추세유지"]),
+        ("J3 수축+재점화", ["R2 눌림수축","R5 재돌파재점화"]),
+        ("J4 자금유입+수축+추세", ["R1 자금유입강","R2 눌림수축","R3 추세유지"]),
+        ("J5 자금유입+수축+재점화", ["R1 자금유입강","R2 눌림수축","R5 재돌파재점화"]),
+        ("J6 수축+추세+전고점", ["R2 눌림수축","R3 추세유지","R4 전고점근접"]),
+        ("J7 핵심4요소", ["R1 자금유입강","R2 눌림수축","R3 추세유지","R5 재돌파재점화"]),
+        ("J8 핵심4+전고점", ["R1 자금유입강","R2 눌림수축","R3 추세유지","R4 전고점근접","R5 재돌파재점화"]),
+        ("J9 핵심4+단기구조", ["R1 자금유입강","R2 눌림수축","R3 추세유지","R5 재돌파재점화","R6 3~10일구조"]),
+    ]
+    out = {}
+    for name, rules in specs:
+        mask = pd.Series(True, index=df.index)
+        for rr in rules:
+            mask &= r[rr](df).fillna(False)
+        out[name] = (rules, mask)
+    return out
+
+
+def j1_compare_on_is(is_df, min_is=15):
+    rows=[]
+    masks=j1_candidate_masks(is_df)
+    for name,(rules,mask) in masks.items():
+        q=is_df[mask].copy()
+        s=j1_stats(q)
+        eligible=(
+            s["신호"] >= min_is
+            and s["승률(%)"] >= 50.0
+            and s["평균수익률(%)"] > 0
+            and s["ProfitFactor"] is not None
+            and s["ProfitFactor"] >= 1.5
+        )
+        rows.append({
+            "후보":name,
+            "구성":" + ".join(rules) if rules else "넓은 구조",
+            **s,
+            "IS합격":eligible,
+        })
+    out=pd.DataFrame(rows).sort_values(
+        ["IS합격","승률(%)","신호","평균수익률(%)","ProfitFactor"],
+        ascending=[False,False,False,False,False]
+    ).reset_index(drop=True)
+    out.insert(0,"IS순위",range(1,len(out)+1))
+    return out
+
+
+def j1_apply_candidate(df, name):
+    masks=j1_candidate_masks(df)
+    if name not in masks:
+        return pd.DataFrame()
+    return df[masks[name][1]].copy()
+
+
+def j1_yearly(df):
+    if df.empty:
+        return pd.DataFrame()
+    q=df.copy()
+    q["연도"]=pd.to_datetime(q["진입일"]).dt.year
+    return pd.DataFrame([
+        {"연도":int(y),**j1_stats(g)}
+        for y,g in q.groupby("연도")
+    ])
+
+
+def j1_market_stats(df):
+    if df.empty:
+        return pd.DataFrame()
+    return pd.DataFrame([
+        {"시장":m,**j1_stats(g)}
+        for m,g in df.groupby("시장")
+    ])
+
+
+def j1_stress(df):
+    if df.empty:
+        return pd.DataFrame()
+    q=df.sort_values("순수익률(%)",ascending=False).reset_index(drop=True)
+    rows=[]
+    for n in [0,1,3]:
+        if len(q)<=n:
+            continue
+        z=q.iloc[n:].copy()
+        rows.append({
+            "최고수익제거":"없음" if n==0 else f"상위 {n}건",
+            **j1_stats(z)
+        })
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# J1 v1.0 — structure research
+# ============================================================
+
+def j1_find_setups(d, code, name, market, cut, end):
+    """
+    가설 구조:
+      1) 최근 120일 평균 대비 큰 거래대금/거래량 + 강한 상승 = 자금유입봉
+      2) 이후 3~20거래일 눌림/횡보, 거래량 감소, 자금유입봉 저가 훼손 제한
+      3) 눌림 구간 상단(관문)을 종가로 재돌파 + 강한 종가
+      4) 돌파일 종가 진입. 청산은 기존 v13.1과 동일.
+    이 함수는 넓은 후보군을 만들고, 구체 컷은 IS에서만 비교한다.
+    """
+    d = add_indicators(d).copy()
+    d["AVG_VALUE20"] = d["거래대금"].shift(1).rolling(20).mean()
+    d["AVG_VALUE60"] = d["거래대금"].shift(1).rolling(60).mean()
+    d["AVG_VOL60"] = d["Volume"].shift(1).rolling(60).mean()
+    d["HH120"] = d["High"].shift(1).rolling(120).max()
+
+    rows = []
+
+    for b in range(120, len(d) - 4):
+        if d.index[b] < cut or d.index[b] > end:
+            continue
+
+        x = d.iloc[b]
+        if any(pd.isna(x[c]) for c in ["AVG_VALUE20","AVG_VALUE60","AVG_VOL20","MA5","MA20"]):
+            continue
+
+        base_value_eok = float(x["거래대금"]) / 1e8
+        value_mult20 = float(x["거래대금"]) / max(float(x["AVG_VALUE20"]), 1.0)
+        value_mult60 = float(x["거래대금"]) / max(float(x["AVG_VALUE60"]), 1.0)
+        vol_mult20 = float(x["Volume"]) / max(float(x["AVG_VOL20"]), 1.0)
+        base_ret = float(x["등락률"])
+
+        # 넓은 '커밍아웃' 후보. 최종 컷이 아니라 탐색용 모집단.
+        if not (
+            base_ret >= 7.0
+            and base_value_eok >= 500.0
+            and value_mult20 >= 2.0
+            and vol_mult20 >= 1.5
+            and float(x["Close"]) > float(x["MA5"])
+        ):
+            continue
+
+        # 자금유입 후 3~20일 동안 형성된 구조에서 첫 '관문 종가돌파' 탐색
+        for br_i in range(b + 3, min(b + 21, len(d))):
+            if d.index[br_i] > end:
+                break
+
+            br = d.iloc[br_i]
+            cons = d.iloc[b+1:br_i]
+
+            if len(cons) < 2:
+                continue
+
+            gate = float(cons["High"].max())
+            cons_low = float(cons["Low"].min())
+            cons_avg_vol = float(cons["Volume"].mean())
+            cons_avg_value = float(cons["거래대금"].mean())
+
+            # 종가로 관문을 실제 회복/돌파해야 함
+            if float(br["Close"]) <= gate:
+                continue
+
+            rng = max(float(br["High"]) - float(br["Low"]), 1.0)
+            close_pos = (float(br["Close"]) - float(br["Low"])) / rng * 100.0
+            bullish = float(br["Close"]) > float(br["Open"])
+
+            # 넓은 재돌파 후보
+            if not (bullish and close_pos >= 55.0):
+                continue
+
+            prior60 = d["High"].iloc[max(0,b-60):b].max()
+            prior120 = d["High"].iloc[max(0,b-120):b].max()
+
+            base_close = float(x["Close"])
+            base_low = float(x["Low"])
+            base_high = float(x["High"])
+            br_close = float(br["Close"])
+
+            pull_from_base = (cons_low / base_close - 1) * 100.0
+            base_low_hold = (cons_low / base_low - 1) * 100.0
+            vol_contract = cons_avg_vol / max(float(x["Volume"]),1.0)
+            value_contract = cons_avg_value / max(float(x["거래대금"]),1.0)
+            br_vol_vs_cons = float(br["Volume"]) / max(cons_avg_vol,1.0)
+            br_value_vs_cons = float(br["거래대금"]) / max(cons_avg_value,1.0)
+            br_value_eok = float(br["거래대금"]) / 1e8
+            ma5_gap = (br_close / float(br["MA5"]) - 1) * 100 if pd.notna(br["MA5"]) else None
+            ma20_gap = (br_close / float(br["MA20"]) - 1) * 100 if pd.notna(br["MA20"]) else None
+            ma20_slope = float(br["MA20기울기5일(%)"]) if pd.notna(br["MA20기울기5일(%)"]) else None
+            prior60_gap = (br_close / float(prior60) - 1) * 100 if pd.notna(prior60) and prior60 else None
+            prior120_gap = (br_close / float(prior120) - 1) * 100 if pd.notna(prior120) and prior120 else None
+            base_to_break = (br_close / base_close - 1) * 100.0
+            gate_break = (br_close / gate - 1) * 100.0
+
+            rows.append({
+                "시장":market,
+                "종목명":name,
+                "코드":str(code).zfill(6),
+                "기준봉일":d.index[b].date(),
+                "기준봉상승률(%)":round(base_ret,2),
+                "기준봉거래대금(억)":round(base_value_eok,1),
+                "기준봉거래대금20배수":round(value_mult20,2),
+                "기준봉거래대금60배수":round(value_mult60,2),
+                "기준봉거래량20배수":round(vol_mult20,2),
+                "기준봉고가":round(base_high),
+                "기준봉저가":round(base_low),
+                "기준봉종가":round(base_close),
+                "구조기간":int(br_i-b-1),
+                "구조관문":round(gate),
+                "구조최저가":round(cons_low),
+                "눌림깊이(%)":round(pull_from_base,2),
+                "기준봉저가유지(%)":round(base_low_hold,2),
+                "구조거래량수축":round(vol_contract,3),
+                "구조거래대금수축":round(value_contract,3),
+                "돌파일":d.index[br_i].date(),
+                "돌파종가":round(br_close),
+                "관문돌파폭(%)":round(gate_break,2),
+                "기준봉대비돌파종가(%)":round(base_to_break,2),
+                "돌파봉등락률(%)":round(float(br["등락률"]),2),
+                "돌파봉종가위치(%)":round(close_pos,2),
+                "돌파거래대금(억)":round(br_value_eok,1),
+                "돌파거래량vs구조평균":round(br_vol_vs_cons,2),
+                "돌파거래대금vs구조평균":round(br_value_vs_cons,2),
+                "진입5일선이격(%)":round(ma5_gap,2) if ma5_gap is not None else None,
+                "진입20일선이격(%)":round(ma20_gap,2) if ma20_gap is not None else None,
+                "20일선5일기울기(%)":round(ma20_slope,2) if ma20_slope is not None else None,
+                "전고점60이격(%)":round(prior60_gap,2) if prior60_gap is not None else None,
+                "전고점120이격(%)":round(prior120_gap,2) if prior120_gap is not None else None,
+                "_b":b,
+                "_breakout_i":br_i,
+            })
+            break
+
+    return rows, d
+
+
+def j1_make_entry(d, setup):
+    i = int(setup["_breakout_i"])
+    br = d.iloc[i]
+    return {
+        "진입전략":"J1 재돌파 종가진입",
+        "진입일":d.index[i].date(),
+        "진입가":float(br["Close"]),
+        "_entry_i":i,
+        "진입설명":"자금유입봉→눌림/횡보→관문 종가 재돌파",
+    }
+
+
+def j1_evaluate_trade(d, setup, entry):
+    # v13.1의 종가진입 청산 로직 재사용:
+    # 진입 당일 OHLC 미사용, 다음 거래일부터 -3% / +2% 활성 / 2% 트레일 / 5일
+    return v13_evaluate_trade(d, setup, entry)
+
+
+def j1_stats(df):
+    s = performance_stats(df)
+    s["손절률(%)"] = 0.0 if df.empty else round(
+        df["청산사유"].astype(str).str.startswith("손절").mean()*100, 1
+    )
+    return s
+
+
+def j1_rule_catalog():
+    # 종산 자료에서 반복된 개념을 '넓은 몇 단계'로만 비교.
+    # 숫자 미세조정은 하지 않는다.
+    return {
+        "R1 자금유입강": lambda d:
+            (d["기준봉거래대금20배수"] >= 4.0)
+            & (d["기준봉거래대금(억)"] >= 1000.0),
+
+        "R2 눌림수축": lambda d:
+            (d["구조거래량수축"] <= 0.55)
+            & (d["기준봉저가유지(%)"] >= -3.0),
+
+        "R3 추세유지": lambda d:
+            (d["진입20일선이격(%)"] >= 0.0)
+            & (d["20일선5일기울기(%)"] > 0.0),
+
+        "R4 전고점근접": lambda d:
+            (d["전고점60이격(%)"] >= -3.0),
+
+        "R5 재돌파재점화": lambda d:
+            (d["돌파거래량vs구조평균"] >= 1.5)
+            & (d["돌파봉종가위치(%)"] >= 70.0),
+
+        "R6 3~10일구조": lambda d:
+            d["구조기간"].between(3,10),
+    }
+
+
+def j1_candidate_masks(df):
+    r = j1_rule_catalog()
+    specs = [
+        ("J0 넓은 구조", []),
+        ("J1 자금유입+수축", ["R1 자금유입강","R2 눌림수축"]),
+        ("J2 자금유입+추세", ["R1 자금유입강","R3 추세유지"]),
+        ("J3 수축+재점화", ["R2 눌림수축","R5 재돌파재점화"]),
+        ("J4 자금유입+수축+추세", ["R1 자금유입강","R2 눌림수축","R3 추세유지"]),
+        ("J5 자금유입+수축+재점화", ["R1 자금유입강","R2 눌림수축","R5 재돌파재점화"]),
+        ("J6 수축+추세+전고점", ["R2 눌림수축","R3 추세유지","R4 전고점근접"]),
+        ("J7 핵심4요소", ["R1 자금유입강","R2 눌림수축","R3 추세유지","R5 재돌파재점화"]),
+        ("J8 핵심4+전고점", ["R1 자금유입강","R2 눌림수축","R3 추세유지","R4 전고점근접","R5 재돌파재점화"]),
+        ("J9 핵심4+단기구조", ["R1 자금유입강","R2 눌림수축","R3 추세유지","R5 재돌파재점화","R6 3~10일구조"]),
+    ]
+    out = {}
+    for name, rules in specs:
+        mask = pd.Series(True, index=df.index)
+        for rr in rules:
+            mask &= r[rr](df).fillna(False)
+        out[name] = (rules, mask)
+    return out
+
+
+def j1_compare_on_is(is_df, min_is=15):
+    rows=[]
+    masks=j1_candidate_masks(is_df)
+    for name,(rules,mask) in masks.items():
+        q=is_df[mask].copy()
+        s=j1_stats(q)
+        eligible=(
+            s["신호"] >= min_is
+            and s["승률(%)"] >= 50.0
+            and s["평균수익률(%)"] > 0
+            and s["ProfitFactor"] is not None
+            and s["ProfitFactor"] >= 1.5
+        )
+        rows.append({
+            "후보":name,
+            "구성":" + ".join(rules) if rules else "넓은 구조",
+            **s,
+            "IS합격":eligible,
+        })
+    out=pd.DataFrame(rows).sort_values(
+        ["IS합격","승률(%)","신호","평균수익률(%)","ProfitFactor"],
+        ascending=[False,False,False,False,False]
+    ).reset_index(drop=True)
+    out.insert(0,"IS순위",range(1,len(out)+1))
+    return out
+
+
+def j1_apply_candidate(df, name):
+    masks=j1_candidate_masks(df)
+    if name not in masks:
+        return pd.DataFrame()
+    return df[masks[name][1]].copy()
+
+
+def j1_yearly(df):
+    if df.empty:
+        return pd.DataFrame()
+    q=df.copy()
+    q["연도"]=pd.to_datetime(q["진입일"]).dt.year
+    return pd.DataFrame([
+        {"연도":int(y),**j1_stats(g)}
+        for y,g in q.groupby("연도")
+    ])
+
+
+def j1_market_stats(df):
+    if df.empty:
+        return pd.DataFrame()
+    return pd.DataFrame([
+        {"시장":m,**j1_stats(g)}
+        for m,g in df.groupby("시장")
+    ])
+
+
+def j1_stress(df):
+    if df.empty:
+        return pd.DataFrame()
+    q=df.sort_values("순수익률(%)",ascending=False).reset_index(drop=True)
+    rows=[]
+    for n in [0,1,3]:
+        if len(q)<=n:
+            continue
+        z=q.iloc[n:].copy()
+        rows.append({
+            "최고수익제거":"없음" if n==0 else f"상위 {n}건",
+            **j1_stats(z)
+        })
+    return pd.DataFrame(rows)
+
+
 # ============================================================
 # UI
 # ============================================================
 with st.sidebar:
-    st.header("v14.2 독립검증 설정")
-
-    end_date = st.date_input(
-        "종료일",
-        date(2026,7,31),
-        disabled=True
-    )
-
-    years = st.number_input(
-        "검증 기간(년)",
-        min_value=5,
-        max_value=5,
-        value=5,
-        disabled=True
-    )
-
-    kospi_n = st.selectbox(
-        "미사용 KOSPI 종목 수",
-        [100,150,200,250],
-        index=2
-    )
-
-    kosdaq_n = st.selectbox(
-        "KOSDAQ 검증 종목 수",
-        [200,300,500],
-        index=1
-    )
-
-    run = st.button(
-        "▶ v14.2 최종 독립검증",
-        type="primary",
-        use_container_width=True
-    )
+    st.header("J1 v1.0 구조탐색 설정")
+    end_date = st.date_input("종료일", date(2026,7,31))
+    years = st.selectbox("검증 기간",[3,4,5],index=2,format_func=lambda x:f"{x}년")
+    per_market = st.selectbox("시장별 종목 수",[200,300,500],index=1)
+    train_ratio = st.selectbox("IS 비율",[0.60,0.70],index=0,format_func=lambda x:f"{int(x*100)}%")
+    min_is = st.selectbox("IS 최소 신호",[12,15,20],index=1)
+    run = st.button("▶ J1 구조탐색 실행",type="primary",use_container_width=True)
 
 st.info(
-    "v14.2에서는 어떤 조건도 다시 찾거나 수정하지 않습니다. "
-    "C 종가강도 전략 + A+B 복합형을 완전히 고정하고, "
-    "v14.1에서 사용한 KOSPI 앞 500종목을 제외한 미사용 KOSPI와 "
-    "별도의 KOSDAQ 표본에서 독립검증합니다."
+    "J1 v1.0은 기존 v14의 6배/7%/12%/6000억 필터를 사용하지 않습니다. "
+    "종산 자료에서 반복된 '큰 자금 유입 → 눌림/횡보 → 관문 재돌파' 구조를 새로 탐색합니다. "
+    "후보 선택은 시간순 앞 구간(IS)에서만 하고, 뒤 구간(OOS)은 선택 후 한 번만 평가합니다."
 )
 
 if run:
-    end_ts = pd.Timestamp(end_date)
-    cut = end_ts - pd.DateOffset(years=int(years))
-    start_ts = cut - pd.Timedelta(days=120)
-    fetch_end = end_ts + pd.Timedelta(days=45)
+    end_ts=pd.Timestamp(end_date)
+    cut=end_ts-pd.DateOffset(years=int(years))
+    start_ts=cut-pd.Timedelta(days=220)
+    fetch_end=end_ts+pd.Timedelta(days=45)
 
     try:
-        listing = stock_listing()
+        listing=stock_listing()
     except Exception as e:
-        st.error(
-            f"종목 목록 조회 실패: {type(e).__name__}"
+        st.error(f"종목 목록 조회 실패: {type(e).__name__}")
+        st.exception(e); st.stop()
+
+    universes={}
+    for market in ["KOSPI","KOSDAQ"]:
+        universes[market]=(
+            listing[listing["Market"]==market]
+            .sort_values("Code")
+            .head(int(per_market))
+            .copy().reset_index(drop=True)
         )
-        st.exception(e)
-        st.stop()
 
-    kospi_u, kospi_overlap, kospi_total = (
-        v142_market_universe(
-            listing,
-            "KOSPI",
-            int(kospi_n)
-        )
-    )
+    total=sum(len(x) for x in universes.values())
+    done=0
+    progress=st.progress(0)
+    status=st.empty()
+    setups=[]
+    data_map={}
+    errors=[]
 
-    kosdaq_u, _, kosdaq_total = (
-        v142_market_universe(
-            listing,
-            "KOSDAQ",
-            int(kosdaq_n)
-        )
-    )
-
-    if kospi_overlap:
-        st.error(
-            f"KOSPI 독립표본 오류: "
-            f"기존 v14.1 사용군과 "
-            f"{len(kospi_overlap)}종목 중복"
-        )
-        st.stop()
-
-    if kospi_u.empty:
-        st.error(
-            f"KOSPI 전체 {kospi_total}종목 중 "
-            f"앞 {V142_KOSPI_USED_N}종목 제외 후 "
-            "검증 가능한 종목이 없습니다."
-        )
-        st.stop()
-
-    if kosdaq_u.empty:
-        st.error("KOSDAQ 검증 종목이 없습니다.")
-        st.stop()
-
-    progress = st.progress(0)
-    status = st.empty()
-    errors = []
-
-    def collect_market_trades(
-        universe,
-        market_name,
-        progress_start,
-        progress_end
-    ):
-        setups = []
-        data_map = {}
-        total = len(universe)
-
-        # ---------------------------
-        # data / setup
-        # ---------------------------
-        for pos, (_, r) in enumerate(
-            universe.iterrows(),
-            1
-        ):
-            code0 = str(r["Code"]).zfill(6)
-            name = r["Name"]
-
-            status.info(
-                f"{market_name} 데이터/신호 "
-                f"{pos}/{total} · {name}"
-            )
-
+    for market,universe in universes.items():
+        for _,r in universe.iterrows():
+            done+=1
+            code0=str(r["Code"]).zfill(6); name=r["Name"]
+            status.info(f"{market} {done}/{total} · {name}")
             try:
-                d = load_data(
-                    code0,
-                    start_ts.strftime("%Y-%m-%d"),
-                    fetch_end.strftime("%Y-%m-%d")
-                )
-
-                if (
-                    d is None
-                    or d.empty
-                    or len(d) < 100
-                ):
-                    continue
-
-                found, prepared = find_setups(
-                    d,
-                    code0,
-                    name,
-                    market_name,
-                    cut,
-                    end_ts
-                )
-
-                data_map[code0] = prepared
-
+                d=load_data(code0,start_ts.strftime("%Y-%m-%d"),fetch_end.strftime("%Y-%m-%d"))
+                if d is None or d.empty or len(d)<160:
+                    progress.progress(done/max(total,1)); continue
+                found,prepared=j1_find_setups(d,code0,name,market,cut,end_ts)
+                data_map[(market,code0)]=prepared
                 if found:
                     setups.extend(found)
-
             except Exception as e:
-                errors.append(
-                    f"{market_name} {name}({code0}): "
-                    f"{type(e).__name__}"
-                )
-
-            frac = (
-                progress_start
-                + (progress_end-progress_start)
-                * 0.50
-                * (pos/max(total,1))
-            )
-            progress.progress(
-                min(frac,1.0)
-            )
-            time.sleep(0.005)
-
-        if not setups:
-            return (
-                pd.DataFrame(),
-                pd.DataFrame()
-            )
-
-        setup_df = dedup_setups(
-            pd.DataFrame(setups)
-        )
-
-        selected = setup_df[
-            setup_df.apply(
-                frozen_filter,
-                axis=1
-            )
-        ].reset_index(drop=True)
-
-        # ---------------------------
-        # C strategy
-        # ---------------------------
-        rows = []
-
-        for idx, (_, setup) in enumerate(
-            selected.iterrows(),
-            1
-        ):
-            code0 = str(
-                setup["코드"]
-            ).zfill(6)
-
-            d = data_map.get(code0)
-
-            if d is None:
-                continue
-
-            entry = v13_make_entry(
-                d,
-                setup,
-                "C 종가강도 종가베팅"
-            )
-
-            if entry is None:
-                continue
-
-            ev = v13_evaluate_trade(
-                d,
-                setup,
-                entry
-            )
-
-            row = setup.drop(
-                labels=[
-                    "_b",
-                    "_pull_i",
-                    "_breakout_i"
-                ],
-                errors="ignore"
-            ).to_dict()
-
-            row.update({
-                k:v
-                for k,v in entry.items()
-                if not k.startswith("_")
-            })
-
-            row.update(ev)
-            row.update(
-                setup_features(
-                    d,
-                    setup
-                )
-            )
-
-            rows.append(row)
-
-            frac = (
-                progress_start
-                + (progress_end-progress_start)
-                * (
-                    0.50
-                    + 0.50
-                    * idx/max(len(selected),1)
-                )
-            )
-
-            progress.progress(
-                min(frac,1.0)
-            )
-
-        c_df = pd.DataFrame(rows)
-
-        if c_df.empty:
-            return c_df, c_df
-
-        filtered = c_df[
-            v142_final_filter(
-                c_df
-            ).fillna(False)
-        ].copy()
-
-        return c_df, filtered
-
-    # KOSPI first half / KOSDAQ second half
-    kospi_c, kospi_f = collect_market_trades(
-        kospi_u,
-        "KOSPI",
-        0.0,
-        0.50
-    )
-
-    kosdaq_c, kosdaq_f = collect_market_trades(
-        kosdaq_u,
-        "KOSDAQ",
-        0.50,
-        1.00
-    )
+                errors.append(f"{market} {name}({code0}): {type(e).__name__}")
+            progress.progress(done/max(total,1))
+            time.sleep(0.003)
 
     progress.empty()
 
-    if kospi_c.empty:
-        st.warning(
-            "미사용 KOSPI에서 C전략 거래가 없습니다."
-        )
+    if not setups:
+        status.warning("J1 구조 후보가 없습니다."); st.stop()
 
-    if kosdaq_c.empty:
-        st.warning(
-            "KOSDAQ에서 C전략 거래가 없습니다."
-        )
+    setup_df=pd.DataFrame(setups).sort_values(["돌파일","코드"]).drop_duplicates(
+        subset=["코드","돌파일"],keep="first"
+    ).reset_index(drop=True)
 
-    if kospi_c.empty and kosdaq_c.empty:
-        st.stop()
+    rows=[]
+    for _,setup in setup_df.iterrows():
+        key=(setup["시장"],str(setup["코드"]).zfill(6))
+        d=data_map.get(key)
+        if d is None:
+            continue
+        entry=j1_make_entry(d,setup)
+        ev=j1_evaluate_trade(d,setup,entry)
+        row=setup.drop(labels=["_b","_breakout_i"],errors="ignore").to_dict()
+        row.update({k:v for k,v in entry.items() if not k.startswith("_")})
+        row.update(ev)
+        rows.append(row)
+
+    trades=pd.DataFrame(rows).sort_values(["진입일","코드"]).reset_index(drop=True)
+    if trades.empty:
+        status.warning("평가 가능한 J1 거래가 없습니다."); st.stop()
 
     status.success(
-        f"완료 · KOSPI {len(kospi_u)}종목 / "
-        f"KOSDAQ {len(kosdaq_u)}종목"
+        f"완료 · KOSPI {len(universes['KOSPI'])} + KOSDAQ {len(universes['KOSDAQ'])}종목 · "
+        f"J1 넓은 구조 {len(trades)}건"
     )
 
-    # ========================================================
-    # ① Independence audit
-    # ========================================================
-    st.subheader(
-        "① 독립표본 감사"
-    )
+    split_i=max(1,min(len(trades)-1,int(len(trades)*float(train_ratio))))
+    is_df=trades.iloc[:split_i].copy()
+    oos_df=trades.iloc[split_i:].copy()
+    oos_start=oos_df.iloc[0]["진입일"] if not oos_df.empty else None
 
-    audit_df = pd.DataFrame([
-        {
-            "시장":"KOSPI",
-            "v14.1 사용범위":
-                f"Code정렬 앞 {V142_KOSPI_USED_N}종목",
-            "v14.2 검증종목":len(kospi_u),
-            "기존군 중복":len(kospi_overlap),
-        },
-        {
-            "시장":"KOSDAQ",
-            "v14.1 사용범위":"미사용",
-            "v14.2 검증종목":len(kosdaq_u),
-            "기존군 중복":0,
-        }
+    st.subheader("① 전체 넓은 구조 베이스라인")
+    baseline=pd.DataFrame([
+        {"구간":"전체",**j1_stats(trades)},
+        {"구간":"IS",**j1_stats(is_df)},
+        {"구간":"OOS",**j1_stats(oos_df)},
     ])
+    st.dataframe(baseline,use_container_width=True,hide_index=True)
 
-    st.dataframe(
-        audit_df,
-        use_container_width=True,
-        hide_index=True
-    )
+    st.subheader("② IS에서만 구조 후보 비교")
+    is_rank=j1_compare_on_is(is_df,int(min_is))
+    st.dataframe(is_rank,use_container_width=True,hide_index=True)
 
-    # ========================================================
-    # ② Headline market comparison
-    # ========================================================
-    st.subheader(
-        "② 시장별 C원본 vs A+B 동결필터"
-    )
+    passed=is_rank[is_rank["IS합격"]==True].copy()
 
-    compare_rows = []
+    if passed.empty:
+        st.warning(
+            "IS 합격 후보가 없습니다. 조건을 억지로 완화하지 않습니다. "
+            "이 경우 J1 v1.0 구조가 승률 우위를 만들지 못한 것으로 판단합니다."
+        )
+        chosen_name=None
+        chosen_is=pd.DataFrame()
+        chosen_oos=pd.DataFrame()
+        chosen_all=pd.DataFrame()
+    else:
+        chosen_name=str(passed.iloc[0]["후보"])
+        chosen_is=j1_apply_candidate(is_df,chosen_name)
+        chosen_oos=j1_apply_candidate(oos_df,chosen_name)
+        chosen_all=j1_apply_candidate(trades,chosen_name)
 
-    for market_name, cdf, fdf in [
-        ("KOSPI", kospi_c, kospi_f),
-        ("KOSDAQ", kosdaq_c, kosdaq_f),
-    ]:
-        if cdf.empty:
-            continue
-
-        compare_rows.append({
-            "시장":market_name,
-            "전략":"C 원본",
-            **v142_stats(cdf)
-        })
-
-        compare_rows.append({
-            "시장":market_name,
-            "전략":"A+B 동결필터",
-            **v142_stats(fdf)
-        })
-
-    compare_df = pd.DataFrame(
-        compare_rows
-    )
-
-    st.dataframe(
-        compare_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # ③ Pass / fail
-    # ========================================================
-    st.subheader(
-        "③ 사전 합격기준 판정"
-    )
-
-    judgement_rows = []
-
-    for market_name, fdf in [
-        ("KOSPI",kospi_f),
-        ("KOSDAQ",kosdaq_f),
-    ]:
-        if fdf.empty:
-            continue
-
-        s = v142_stats(fdf)
-
-        judgement_rows.append({
-            "시장":market_name,
-            "신호":s["신호"],
-            "승률(%)":s["승률(%)"],
-            "평균수익률(%)":
-                s["평균수익률(%)"],
-            "PF":s["ProfitFactor"],
-            "MDD(%)":s["MDD(%)"],
-            "손절률(%)":s["손절률(%)"],
-            "합격":v142_pass_judgement(s),
-        })
-
-    judgement_df = pd.DataFrame(
-        judgement_rows
-    )
-
-    st.dataframe(
-        judgement_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    if not judgement_df.empty:
-        passes = int(
-            judgement_df["합격"].sum()
+        st.success(
+            f"IS 선택 후보: **{chosen_name}** · "
+            f"IS 승률 {j1_stats(chosen_is)['승률(%)']:.1f}% / "
+            f"{j1_stats(chosen_is)['신호']}건. "
+            f"OOS 시작일: {oos_start}"
         )
 
-        if passes == len(judgement_df):
+        st.subheader("③ 선택 후보 OOS 검증")
+        eval_df=pd.DataFrame([
+            {"구간":"IS",**j1_stats(chosen_is)},
+            {"구간":"OOS",**j1_stats(chosen_oos)},
+            {"구간":"전체 참고",**j1_stats(chosen_all)},
+        ])
+        st.dataframe(eval_df,use_container_width=True,hide_index=True)
+
+        o=j1_stats(chosen_oos)
+        oos_pass=(
+            o["신호"]>=8
+            and o["승률(%)"]>=50.0
+            and o["평균수익률(%)"]>0
+            and o["ProfitFactor"] is not None
+            and o["ProfitFactor"]>=1.5
+        )
+        if oos_pass:
             st.success(
-                "✅ 독립검증 통과: "
-                "검증 가능한 모든 시장에서 "
-                "신호≥20 / 승률≥50% / "
-                "평균수익률>0 / PF≥1.5 / "
-                "MDD>-25%를 충족했습니다."
-            )
-        elif passes > 0:
-            st.warning(
-                "⚠️ 부분 통과: 시장에 따라 "
-                "재현성이 다릅니다. "
-                "통과 시장과 탈락 시장을 분리해서 봐야 합니다."
+                "✅ 1차 OOS 통과. 아직 최종 확정이 아니라, 다음 버전에서 "
+                "완전히 미사용 종목군으로 독립검증할 가치가 있습니다."
             )
         else:
             st.warning(
-                "❌ 독립검증 탈락: "
-                "A+B 필터의 v14.1 성과가 "
-                "새 표본에서 충분히 재현되지 않았습니다."
+                "❌ OOS 기준 미충족. 이 구조를 숫자 미세조정으로 살리지 말고 "
+                "실패 사례의 구조 차이를 다시 분석하는 것이 맞습니다."
             )
 
-    # ========================================================
-    # ④ Time 60/40
-    # ========================================================
-    st.subheader(
-        "④ 시장별 시간순 60/40"
-    )
+        st.subheader("④ 선택 후보 시장별 성과")
+        market_df=j1_market_stats(chosen_all)
+        st.dataframe(market_df,use_container_width=True,hide_index=True)
 
-    time_rows = []
+        st.subheader("⑤ 선택 후보 연도별 성과")
+        year_df=j1_yearly(chosen_all)
+        st.dataframe(year_df,use_container_width=True,hide_index=True)
 
-    for market_name, fdf in [
-        ("KOSPI",kospi_f),
-        ("KOSDAQ",kosdaq_f),
-    ]:
-        if fdf.empty:
-            continue
+        st.subheader("⑥ 아웃라이어 스트레스")
+        stress_df=j1_stress(chosen_all)
+        st.dataframe(stress_df,use_container_width=True,hide_index=True)
 
-        t = v142_time_split(fdf)
-
-        if not t.empty:
-            t.insert(
-                0,
-                "시장",
-                market_name
-            )
-            time_rows.append(t)
-
-    time_df = (
-        pd.concat(
-            time_rows,
-            ignore_index=True
-        )
-        if time_rows
-        else pd.DataFrame()
-    )
-
-    st.dataframe(
-        time_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # ⑤ Yearly
-    # ========================================================
-    st.subheader(
-        "⑤ 시장별 연도성과"
-    )
-
-    year_rows = []
-
-    for market_name, fdf in [
-        ("KOSPI",kospi_f),
-        ("KOSDAQ",kosdaq_f),
-    ]:
-        if fdf.empty:
-            continue
-
-        y = v142_yearly(fdf)
-
-        if not y.empty:
-            y.insert(
-                0,
-                "시장",
-                market_name
-            )
-            year_rows.append(y)
-
-    year_df = (
-        pd.concat(
-            year_rows,
-            ignore_index=True
-        )
-        if year_rows
-        else pd.DataFrame()
-    )
-
-    st.dataframe(
-        year_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # ⑥ Outlier stress
-    # ========================================================
-    st.subheader(
-        "⑥ 아웃라이어 스트레스"
-    )
-
-    stress_rows = []
-
-    for market_name, fdf in [
-        ("KOSPI",kospi_f),
-        ("KOSDAQ",kosdaq_f),
-    ]:
-        if fdf.empty:
-            continue
-
-        z = v142_outlier_stress(
-            fdf
-        )
-
-        if not z.empty:
-            z.insert(
-                0,
-                "시장",
-                market_name
-            )
-            stress_rows.append(z)
-
-    stress_df = (
-        pd.concat(
-            stress_rows,
-            ignore_index=True
-        )
-        if stress_rows
-        else pd.DataFrame()
-    )
-
-    st.dataframe(
-        stress_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # ⑦ Actual filtered trades
-    # ========================================================
-    st.subheader(
-        "⑦ 독립검증 실제 거래"
-    )
-
-    trade_frames = []
-
-    for market_name, fdf in [
-        ("KOSPI",kospi_f),
-        ("KOSDAQ",kosdaq_f),
-    ]:
-        if fdf.empty:
-            continue
-
-        q = fdf.copy()
-        q["검증시장"] = market_name
-        trade_frames.append(q)
-
-    filtered_all = (
-        pd.concat(
-            trade_frames,
-            ignore_index=True
-        )
-        if trade_frames
-        else pd.DataFrame()
-    )
-
-    cols = [
-        "검증시장",
-        "종목명",
-        "코드",
-        "진입일",
-        "기준봉거래대금(억)",
-        "돌파거래량배수20",
-        "진입5일선이격(%)",
-        "돌파종가수익률(%)",
-        "전고점20이격(%)",
-        "눌림깊이(%)",
-        "순수익률(%)",
-        "MFE(%)",
-        "MAE(%)",
-        "청산사유",
-    ]
-
-    if not filtered_all.empty:
+        st.subheader("⑦ 선택 후보 실제 거래")
+        show_cols=[
+            "시장","종목명","코드","기준봉일","기준봉상승률(%)",
+            "기준봉거래대금(억)","기준봉거래대금20배수",
+            "구조기간","눌림깊이(%)","기준봉저가유지(%)",
+            "구조거래량수축","돌파일","돌파거래량vs구조평균",
+            "돌파봉종가위치(%)","전고점60이격(%)",
+            "진입일","진입가","순수익률(%)","MFE(%)","MAE(%)","청산사유"
+        ]
         st.dataframe(
-            filtered_all[
-                [
-                    c for c in cols
-                    if c in filtered_all.columns
-                ]
-            ].sort_values(
-                ["검증시장","진입일"],
-                ascending=[True,False]
-            ),
-            use_container_width=True,
-            hide_index=True
+            chosen_all[[c for c in show_cols if c in chosen_all.columns]]
+            .sort_values("진입일",ascending=False),
+            use_container_width=True,hide_index=True
         )
 
-    # ========================================================
-    # ⑧ Excel
-    # ========================================================
-    st.subheader(
-        "⑧ v14.2 전체 독립검증 Excel"
-    )
-
-    settings_df = pd.DataFrame([
-        {
-            "항목":"기준전략",
-            "값":"C 종가강도 종가베팅"
-        },
-        {
-            "항목":"최종필터",
-            "값":"(거래량배수20<=6 AND 5일선이격>=12%) OR 5일선이격<=7% OR 기준봉거래대금>=6000억"
-        },
-        {
-            "항목":"조건재조정",
-            "값":"금지"
-        },
-        {
-            "항목":"KOSPI 독립성",
-            "값":"v14.1 앞500종목 제외"
-        },
-        {
-            "항목":"KOSDAQ",
-            "값":"v14.1 필터개발 미사용 시장 별도 검증"
-        },
-        {
-            "항목":"사전합격선",
-            "값":"시장별 신호>=20 / 승률>=50% / 평균>0 / PF>=1.5 / MDD>-25%"
-        },
+    st.subheader("⑧ J1 v1.0 전체 Excel")
+    settings=pd.DataFrame([
+        {"항목":"전략가설","값":"큰 자금유입 → 눌림/횡보 → 관문 종가 재돌파"},
+        {"항목":"진입","값":"재돌파일 종가"},
+        {"항목":"청산","값":"-3% 손절 / +2% 활성 / 2% 트레일 / 다음날부터 / 최대5거래일 / 비용0.40%"},
+        {"항목":"후보선택","값":"시간순 IS에서만 선택"},
+        {"항목":"OOS","값":f"{int((1-float(train_ratio))*100)}% / 선택 후 평가"},
+        {"항목":"승률우선 합격","값":"IS 승률>=50%, 평균>0, PF>=1.5, 최소신호 충족"},
+        {"항목":"기존v14필터","값":"사용 안 함"},
     ])
 
-    excel_bytes = build_excel({
-        "00_설정":settings_df,
-        "01_표본감사":audit_df,
-        "02_시장별비교":compare_df,
-        "03_합격판정":judgement_df,
-        "04_시간60_40":time_df,
-        "05_연도별":year_df,
-        "06_아웃라이어":stress_df,
-        "07_KOSPI_C원본":kospi_c,
-        "08_KOSPI_필터":kospi_f,
-        "09_KOSDAQ_C원본":kosdaq_c,
-        "10_KOSDAQ_필터":kosdaq_f,
-        "11_필터전체거래":filtered_all,
-    })
+    sheets={
+        "00_설정":settings,
+        "01_베이스라인":baseline,
+        "02_IS후보비교":is_rank,
+        "03_전체구조거래":trades,
+        "04_IS원자료":is_df,
+        "05_OOS원자료":oos_df,
+    }
 
+    if chosen_name is not None:
+        sheets.update({
+            "06_선택후보_IS":chosen_is,
+            "07_선택후보_OOS":chosen_oos,
+            "08_선택후보_전체":chosen_all,
+            "09_시장별":market_df,
+            "10_연도별":year_df,
+            "11_아웃라이어":stress_df,
+        })
+
+    excel_bytes=build_excel(sheets)
     st.download_button(
-        "📦 v14.2 최종 독립검증 Excel 다운로드",
+        "📦 J1 v1.0 구조탐색 전체 Excel 다운로드",
         data=excel_bytes,
-        file_name="swing_v14_2_final_independent_validation.xlsx",
+        file_name="swing_J1_v1_0_structure_research.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
 
     if errors:
-        with st.expander(
-            f"조회 실패/데이터 부족 "
-            f"{len(errors)}건"
-        ):
+        with st.expander(f"조회 실패/데이터 부족 {len(errors)}건"):
             st.write(errors)
 
 st.caption(
-    "v14.2는 최종 독립검증판입니다. "
-    "A+B 복합형 조건은 완전히 동결하며, "
-    "결과가 나쁘더라도 이 버전에서 6배/7%/12%/6000억 값을 수정하지 않습니다."
+    "J1 v1.0은 구조 가설 탐색판입니다. OOS 결과를 본 뒤 같은 OOS에서 컷을 다시 조정하지 않습니다."
 )
