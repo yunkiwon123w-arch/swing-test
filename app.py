@@ -4171,8 +4171,9 @@ def j2_pairwise_same_signal(df, mode1, mode2):
 
 
 
+
 # ============================================================
-# J6 v1.0 — paper trading operations dashboard
+# J6.1 — paper trading dashboard + watchlist tiers
 # ============================================================
 
 J4_PRIOR60_MAX = 12.905
@@ -4184,20 +4185,46 @@ J4_RULE_TEXT = (
     f"AND 진입5일선이격(%) <= {J4_MA5_GAP_MAX}"
 )
 
-def j4_apply_rule(df):
-    p60 = pd.to_numeric(df["전고점60이격(%)"], errors="coerce")
-    ma5 = pd.to_numeric(df["진입5일선이격(%)"], errors="coerce")
-    return df[
-        (p60 <= J4_PRIOR60_MAX)
-        & (ma5 <= J4_MA5_GAP_MAX)
-    ].copy()
+def j61_classify_candidate(row):
+    """
+    후보 상태를 3단계로 분류.
+    A: 완전 통과 — 실제 모의매매 대상
+    B: 5일선 눌림 대기 — J4 prior60 통과, 아직 D 진입 미발생
+    C: 근접 관찰 — J4 두 조건 중 하나만 근소하게 미달
+    """
+    p60 = pd.to_numeric(
+        pd.Series([row.get("전고점60이격(%)")]),
+        errors="coerce"
+    ).iloc[0]
+
+    ma5 = pd.to_numeric(
+        pd.Series([row.get("진입5일선이격(%)")]),
+        errors="coerce"
+    ).iloc[0]
+
+    state = str(row.get("현재상태", ""))
+
+    p60_ok = pd.notna(p60) and p60 <= J4_PRIOR60_MAX
+    ma5_ok = pd.notna(ma5) and ma5 <= J4_MA5_GAP_MAX
+
+    if state == "D진입 발생" and p60_ok and ma5_ok:
+        return "A 완전통과"
+
+    if state == "5일선 눌림 대기" and p60_ok:
+        return "B 5일선대기"
+
+    # Observation-only near misses.
+    # This does not relax the strategy. It only identifies names close to the frozen cut.
+    p60_near = pd.notna(p60) and J4_PRIOR60_MAX < p60 <= J4_PRIOR60_MAX + 3.0
+    ma5_near = pd.notna(ma5) and J4_MA5_GAP_MAX < ma5 <= J4_MA5_GAP_MAX + 3.0
+
+    if (p60_near and ma5_ok) or (p60_ok and ma5_near):
+        return "C 근접관찰"
+
+    return "제외"
 
 
-def j6_find_latest_candidates(listing, per_market, asof_date):
-    """
-    오늘 기준 최근 J1 구조 신호 중 아직 D=5일선 눌림 진입이 가능한 후보를 찾는다.
-    과거 백테스트처럼 전체 기간을 평가하지 않고, 현재 시점에서 '후보 상태'만 만든다.
-    """
+def j61_find_latest_candidates(listing, per_market, asof_date):
     start_ts = pd.Timestamp(asof_date) - pd.Timedelta(days=220)
     fetch_end = pd.Timestamp(asof_date) + pd.Timedelta(days=1)
 
@@ -4227,7 +4254,6 @@ def j6_find_latest_candidates(listing, per_market, asof_date):
                 if d is None or d.empty or len(d) < 160:
                     continue
 
-                # latest few months only
                 found, prepared = j1_find_setups(
                     d,
                     code,
@@ -4240,8 +4266,10 @@ def j6_find_latest_candidates(listing, per_market, asof_date):
                 if not found:
                     continue
 
-                # only latest structure per stock
-                found = sorted(found, key=lambda x: pd.Timestamp(x["돌파일"]))
+                found = sorted(
+                    found,
+                    key=lambda x: pd.Timestamp(x["돌파일"])
+                )
                 setup = found[-1]
 
                 entries = [
@@ -4253,12 +4281,13 @@ def j6_find_latest_candidates(listing, per_market, asof_date):
                     if e["진입전략"] == "D 5일선 눌림"
                 ]
 
-                # If D entry already occurred in history, candidate is no longer fresh.
-                # Only retain if entry date is very recent (today or last 2 trading/calendar days).
                 if entries:
                     e = entries[-1]
                     entry_date = pd.Timestamp(e["진입일"])
-                    age_days = (pd.Timestamp(asof_date).normalize() - entry_date.normalize()).days
+                    age_days = (
+                        pd.Timestamp(asof_date).normalize()
+                        - entry_date.normalize()
+                    ).days
 
                     row = dict(setup)
                     row.update({
@@ -4268,15 +4297,14 @@ def j6_find_latest_candidates(listing, per_market, asof_date):
                         "진입경과일": age_days,
                     })
 
-                    tmp = pd.DataFrame([row])
-                    passed = not j4_apply_rule(tmp).empty
-                    row["J4필터통과"] = passed
-
-                    if passed and age_days <= 2:
-                        rows.append(row)
+                    # Only recent entries are relevant to today's operating screen.
+                    if age_days <= 2:
+                        row["후보등급"] = j61_classify_candidate(row)
+                        if row["후보등급"] != "제외":
+                            rows.append(row)
                     continue
 
-                # No D entry yet. Check whether still within 5-day waiting window after breakout.
+                # Waiting for D entry after breakout
                 br_i = int(setup["_breakout_i"])
                 last_i = len(prepared) - 1
                 elapsed = last_i - br_i
@@ -4290,32 +4318,41 @@ def j6_find_latest_candidates(listing, per_market, asof_date):
                 if ma5 is None or ma5 <= 0:
                     continue
 
+                # Current gap to MA5 is useful for watchlist only.
+                current_close = float(last["Close"])
+                current_ma5_gap = (
+                    (current_close / ma5 - 1) * 100
+                    if ma5 > 0 else None
+                )
+
                 row = dict(setup)
                 row.update({
                     "현재상태": "5일선 눌림 대기",
                     "예상진입일": None,
                     "예상진입가": round(ma5, 2),
                     "진입경과일": elapsed,
+                    "현재가": round(current_close, 2),
+                    "현재5일선": round(ma5, 2),
+                    "현재5일선이격(%)": round(current_ma5_gap, 2) if current_ma5_gap is not None else None,
                 })
 
-                tmp = pd.DataFrame([{
-                    **row,
-                    "진입5일선이격(%)": row.get("진입5일선이격(%)", None)
-                }])
+                # For waiting names, actual J4 MA5 gap is confirmed only at touch.
+                row["후보등급"] = j61_classify_candidate(row)
 
-                # For waiting names, J4 MA5-gap should be evaluated at eventual entry.
-                # Therefore only pre-screen prior60 now; final check happens at touch.
+                # Keep B waiting names even though eventual MA5-entry variable is not final yet.
                 p60 = pd.to_numeric(
                     pd.Series([row.get("전고점60이격(%)")]),
                     errors="coerce"
                 ).iloc[0]
 
-                row["J4필터통과"] = (
-                    pd.notna(p60)
-                    and p60 <= J4_PRIOR60_MAX
-                )
+                if pd.notna(p60) and p60 <= J4_PRIOR60_MAX:
+                    row["후보등급"] = "B 5일선대기"
+                    rows.append(row)
+                    continue
 
-                if row["J4필터통과"]:
+                # Near prior60 miss for observation.
+                if pd.notna(p60) and J4_PRIOR60_MAX < p60 <= J4_PRIOR60_MAX + 3.0:
+                    row["후보등급"] = "C 근접관찰"
                     rows.append(row)
 
             except Exception as e:
@@ -4327,14 +4364,6 @@ def j6_find_latest_candidates(listing, per_market, asof_date):
 
 
 def j6_priority_score(df):
-    """
-    3종목 제한 시 우선순위.
-    새 전략 최적화가 아니라 기존 J4 논리를 운영 규칙으로 단순 정렬:
-      1) 전고점60 이격이 낮을수록 우선
-      2) 5일선 이격이 낮을수록 우선
-      3) 구조거래량 수축이 낮을수록 우선
-      4) 기준봉 거래대금이 클수록 우선
-    """
     q = df.copy()
 
     for c in [
@@ -4343,28 +4372,21 @@ def j6_priority_score(df):
         "구조거래량수축",
         "기준봉거래대금(억)"
     ]:
-        q[c] = pd.to_numeric(q.get(c), errors="coerce")
+        if c not in q.columns:
+            q[c] = np.nan
+        q[c] = pd.to_numeric(q[c], errors="coerce")
 
-    # Rank-based score avoids inventing new hard thresholds.
     q["_r1"] = q["전고점60이격(%)"].rank(
-        method="min",
-        ascending=True,
-        na_option="bottom"
+        method="min", ascending=True, na_option="bottom"
     )
     q["_r2"] = q["진입5일선이격(%)"].rank(
-        method="min",
-        ascending=True,
-        na_option="bottom"
+        method="min", ascending=True, na_option="bottom"
     )
     q["_r3"] = q["구조거래량수축"].rank(
-        method="min",
-        ascending=True,
-        na_option="bottom"
+        method="min", ascending=True, na_option="bottom"
     )
     q["_r4"] = q["기준봉거래대금(억)"].rank(
-        method="min",
-        ascending=False,
-        na_option="bottom"
+        method="min", ascending=False, na_option="bottom"
     )
 
     q["운용우선순위점수"] = (
@@ -4375,14 +4397,8 @@ def j6_priority_score(df):
     )
 
     q = q.sort_values(
-        [
-            "운용우선순위점수",
-            "돌파일"
-        ],
-        ascending=[
-            True,
-            False
-        ]
+        ["운용우선순위점수", "돌파일"],
+        ascending=[True, False]
     ).reset_index(drop=True)
 
     q["우선순위"] = range(1, len(q) + 1)
@@ -4393,10 +4409,38 @@ def j6_priority_score(df):
     )
 
 
+def j61_order_plan(pass_df, paper_cash, existing_positions):
+    slots = max(
+        0,
+        J6_MAX_POSITIONS - int(existing_positions)
+    )
+
+    q = pass_df.copy()
+
+    if q.empty:
+        q["모의매매선정"] = False
+        q["배정금액"] = 0
+        return q, slots
+
+    q = j6_priority_score(q)
+
+    q["모의매매선정"] = (
+        q["우선순위"] <= slots
+    )
+
+    allocation = (
+        float(paper_cash) / slots
+        if slots > 0 else 0
+    )
+
+    q["배정금액"] = q["모의매매선정"].map(
+        lambda x: round(allocation) if x else 0
+    )
+
+    return q, slots
+
+
 def j6_position_management(entry_price, current_price, highest_price):
-    """
-    J4/J5.1과 동일한 청산 규칙을 실전용 숫자로 표시.
-    """
     entry_price = float(entry_price)
     current_price = float(current_price)
     highest_price = float(highest_price)
@@ -4428,62 +4472,26 @@ def j6_position_management(entry_price, current_price, highest_price):
     }
 
 
-def j6_order_plan(candidates, paper_cash, existing_positions):
-    """
-    최대 3종목 동일비중.
-    기존 보유 종목 수를 제외한 남은 슬롯에 현금을 균등 배분.
-    """
-    slots = max(
-        0,
-        J6_MAX_POSITIONS - int(existing_positions)
-    )
-
-    q = candidates.copy()
-
-    if q.empty or slots <= 0:
-        q["모의매매선정"] = False
-        q["배정금액"] = 0
-        return q, slots
-
-    q = j6_priority_score(q)
-
-    q["모의매매선정"] = (
-        q["우선순위"] <= slots
-    )
-
-    allocation = (
-        float(paper_cash) / slots
-        if slots > 0
-        else 0
-    )
-
-    q["배정금액"] = q["모의매매선정"].map(
-        lambda x: round(allocation) if x else 0
-    )
-
-    return q, slots
-
-
 # ============================================================
 # UI
 # ============================================================
 
 st.set_page_config(
-    page_title="J6 v1.0 모의매매 운영판",
+    page_title="J6.1 모의매매 운영판",
     layout="wide"
 )
 
 st.title(
-    "🟢 J6 v1.0 · 모의매매 실전 운영판"
+    "🟢 J6.1 · 모의매매 운영판 + 관찰리스트"
 )
 
 st.caption(
-    "J4 전략 고정 · J5.1 3종목 운용 · "
-    "신규 후보 / 주문 우선순위 / 보유종목 청산관리"
+    "완전 통과 / 5일선 대기 / 근접 관찰을 분리 · "
+    "실제 모의매수는 A 완전통과만"
 )
 
 with st.sidebar:
-    st.header("J6 운용 설정")
+    st.header("J6.1 운용 설정")
 
     asof_date = st.date_input(
         "기준일",
@@ -4513,56 +4521,39 @@ with st.sidebar:
     )
 
     run = st.button(
-        "▶ 오늘 후보 검색",
+        "▶ 오늘 후보 + 관찰리스트 검색",
         type="primary",
         use_container_width=True
     )
 
 st.info(
-    f"고정 규칙: J1 구조 → D 첫 5일선 눌림 → {J4_RULE_TEXT}. "
-    "최대 동시보유는 3종목으로 고정합니다. "
-    "신규 후보가 3개를 넘으면 새로운 컷을 만들지 않고 기존 J4 구조변수의 순위만 사용합니다."
+    f"고정 매매규칙: J1 구조 → D 첫 5일선 눌림 → {J4_RULE_TEXT}. "
+    "B/C 등급은 관찰용이며 매수 조건을 완화한 것이 아닙니다. "
+    "실제 모의매수 후보는 A 완전통과만 사용합니다."
 )
 
-st.subheader("① 모의매매 운영 규칙")
+st.subheader("① 후보 등급")
 
-rules_df = pd.DataFrame([
+grade_df = pd.DataFrame([
     {
-        "단계":"종목선정",
-        "운영규칙":"J1 자금유입→눌림/횡보→관문 재돌파 구조"
+        "등급":"A 완전통과",
+        "의미":"D 5일선 진입 발생 + J4 두 조건 모두 통과",
+        "매수":"모의매매 가능"
     },
     {
-        "단계":"진입",
-        "운영규칙":"재돌파 후 최대 5거래일 내 첫 5일선 터치"
+        "등급":"B 5일선대기",
+        "의미":"J1/J4 구조는 유효, 아직 5일선 첫 터치를 기다리는 상태",
+        "매수":"대기"
     },
     {
-        "단계":"최종필터",
-        "운영규칙":J4_RULE_TEXT
-    },
-    {
-        "단계":"초기손절",
-        "운영규칙":"진입가 대비 -3%"
-    },
-    {
-        "단계":"트레일 활성",
-        "운영규칙":"진입 후 +2% 이상 도달"
-    },
-    {
-        "단계":"트레일",
-        "운영규칙":"활성 후 최고가 대비 -2%, 단 진입가 이하로 내리지 않음"
-    },
-    {
-        "단계":"기간청산",
-        "운영규칙":"진입 다음날부터 최대 5거래일"
-    },
-    {
-        "단계":"동시보유",
-        "운영규칙":"최대 3종목"
+        "등급":"C 근접관찰",
+        "의미":"J4 한 조건이 컷에서 최대 +3%p 이내 부족",
+        "매수":"금지 / 관찰만"
     },
 ])
 
 st.dataframe(
-    rules_df,
+    grade_df,
     use_container_width=True,
     hide_index=True
 )
@@ -4578,9 +4569,9 @@ if run:
         st.stop()
 
     with st.spinner(
-        "현재 조건에 맞는 후보를 검색 중입니다..."
+        "완전통과·대기·근접 후보를 검색 중입니다..."
     ):
-        candidates, errors = j6_find_latest_candidates(
+        candidates, errors = j61_find_latest_candidates(
             listing,
             int(per_market),
             pd.Timestamp(asof_date)
@@ -4588,141 +4579,164 @@ if run:
 
     if candidates.empty:
         st.warning(
-            "현재 기준일에는 J6 조건을 만족하는 신규 후보가 없습니다."
+            "오늘은 완전통과·대기·근접 관찰 후보가 모두 없습니다."
         )
     else:
-        candidates = candidates[
-            candidates["J4필터통과"] == True
+        a_df = candidates[
+            candidates["후보등급"] == "A 완전통과"
         ].copy()
 
-        plan, slots = j6_order_plan(
-            candidates,
-            int(paper_cash),
-            int(existing_positions)
-        )
-
-        st.subheader("② 오늘 신규 후보")
-
-        show_cols = [
-            "우선순위",
-            "시장",
-            "종목명",
-            "코드",
-            "현재상태",
-            "돌파일",
-            "예상진입일",
-            "예상진입가",
-            "진입경과일",
-            "전고점60이격(%)",
-            "진입5일선이격(%)",
-            "구조거래량수축",
-            "기준봉거래대금(억)",
-            "모의매매선정",
-            "배정금액",
-        ]
-
-        st.dataframe(
-            plan[
-                [
-                    c for c in show_cols
-                    if c in plan.columns
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True
-        )
-
-        selected_today = plan[
-            plan["모의매매선정"] == True
+        b_df = candidates[
+            candidates["후보등급"] == "B 5일선대기"
         ].copy()
 
-        st.subheader("③ 오늘 주문 계획")
+        c_df = candidates[
+            candidates["후보등급"] == "C 근접관찰"
+        ].copy()
 
-        if selected_today.empty:
-            st.info(
-                "현재 보유 종목 수 때문에 신규 진입 슬롯이 없습니다."
-            )
+        st.subheader("② A 완전통과 — 오늘 모의매매 후보")
+
+        if a_df.empty:
+            st.info("오늘 A 완전통과 후보는 없습니다.")
+            plan = pd.DataFrame()
+            slots = max(0, J6_MAX_POSITIONS - int(existing_positions))
         else:
-            order_cols = [
-                "우선순위",
-                "시장",
-                "종목명",
-                "코드",
-                "현재상태",
-                "예상진입가",
-                "배정금액",
+            plan, slots = j61_order_plan(
+                a_df,
+                int(paper_cash),
+                int(existing_positions)
+            )
+
+            cols = [
+                "우선순위","시장","종목명","코드",
+                "돌파일","예상진입일","예상진입가",
+                "전고점60이격(%)","진입5일선이격(%)",
+                "구조거래량수축","기준봉거래대금(억)",
+                "모의매매선정","배정금액"
             ]
 
             st.dataframe(
-                selected_today[
-                    [
-                        c for c in order_cols
-                        if c in selected_today.columns
-                    ]
-                ],
+                plan[[c for c in cols if c in plan.columns]],
+                use_container_width=True,
+                hide_index=True
+            )
+
+        st.subheader("③ B 5일선 눌림 대기 — 관심종목")
+
+        if b_df.empty:
+            st.info("현재 5일선 눌림 대기 종목은 없습니다.")
+        else:
+            b_df = j6_priority_score(b_df)
+
+            b_cols = [
+                "우선순위","시장","종목명","코드",
+                "돌파일","진입경과일","현재가",
+                "현재5일선","현재5일선이격(%)",
+                "예상진입가","전고점60이격(%)",
+                "구조거래량수축","기준봉거래대금(억)"
+            ]
+
+            st.dataframe(
+                b_df[[c for c in b_cols if c in b_df.columns]],
                 use_container_width=True,
                 hide_index=True
             )
 
             st.caption(
-                "실제 체결은 예상진입가 부근에서 5일선 첫 터치가 확인될 때만 모의체결합니다. "
-                "대기 상태인 종목을 미리 매수하지 않습니다."
+                "B등급은 5일선 가격에 미리 매수하는 목록이 아닙니다. "
+                "실제 첫 터치가 발생하고 최종 J4 조건을 확인한 뒤 A등급으로 전환될 때만 모의매수합니다."
             )
 
-        st.subheader("④ 후보 전체 Excel")
+        st.subheader("④ C 근접 관찰 — 왜 탈락했는지 확인")
 
-        settings = pd.DataFrame([
-            {
-                "항목":"전략",
-                "값":(
-                    "J1 구조 + D 5일선 눌림 + "
-                    + J4_RULE_TEXT
-                )
-            },
-            {
-                "항목":"최대동시보유",
-                "값":J6_MAX_POSITIONS
-            },
-            {
-                "항목":"가용현금",
-                "값":int(paper_cash)
-            },
-            {
-                "항목":"현재보유",
-                "값":int(existing_positions)
-            },
-            {
-                "항목":"남은슬롯",
-                "값":int(slots)
-            },
-            {
-                "항목":"우선순위",
-                "값":"전고점60 이격 → 5일선 이격 → 구조거래량수축 → 기준봉 거래대금"
-            },
-            {
-                "항목":"중요",
-                "값":"운영 우선순위일 뿐 전략 필터 추가가 아님"
-            },
+        if c_df.empty:
+            st.info("현재 근접 관찰 종목은 없습니다.")
+        else:
+            c_df = j6_priority_score(c_df)
+
+            def fail_reason(r):
+                reasons = []
+                p60 = pd.to_numeric(
+                    pd.Series([r.get("전고점60이격(%)")]),
+                    errors="coerce"
+                ).iloc[0]
+                ma5 = pd.to_numeric(
+                    pd.Series([r.get("진입5일선이격(%)")]),
+                    errors="coerce"
+                ).iloc[0]
+
+                if pd.notna(p60) and p60 > J4_PRIOR60_MAX:
+                    reasons.append(
+                        f"전고점60 +{p60-J4_PRIOR60_MAX:.2f}%p 초과"
+                    )
+                if pd.notna(ma5) and ma5 > J4_MA5_GAP_MAX:
+                    reasons.append(
+                        f"5일선이격 +{ma5-J4_MA5_GAP_MAX:.2f}%p 초과"
+                    )
+                return " / ".join(reasons) if reasons else "관찰"
+
+            c_df["탈락사유"] = c_df.apply(fail_reason, axis=1)
+
+            c_cols = [
+                "우선순위","시장","종목명","코드",
+                "현재상태","돌파일",
+                "전고점60이격(%)","진입5일선이격(%)",
+                "탈락사유","예상진입가"
+            ]
+
+            st.dataframe(
+                c_df[[c for c in c_cols if c in c_df.columns]],
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.warning(
+                "C등급은 백테스트 조건을 완화한 후보가 아닙니다. "
+                "실제 모의매수 금지이며, 향후 조건 근처 종목이 어떻게 움직이는지 관찰하기 위한 목록입니다."
+            )
+
+        st.subheader("⑤ 오늘 전체 현황")
+
+        summary = pd.DataFrame([
+            {"구분":"A 완전통과","종목수":len(a_df)},
+            {"구분":"B 5일선대기","종목수":len(b_df)},
+            {"구분":"C 근접관찰","종목수":len(c_df)},
         ])
 
-        excel_bytes = build_excel({
-            "00_운영설정":settings,
-            "01_오늘후보":plan,
-            "02_오늘선정":selected_today,
-        })
+        st.dataframe(
+            summary,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        settings = pd.DataFrame([
+            {"항목":"고정전략","값":f"J1 구조 + D 5일선 눌림 + {J4_RULE_TEXT}"},
+            {"항목":"최대동시보유","값":J6_MAX_POSITIONS},
+            {"항목":"실제모의매수","값":"A 완전통과만"},
+            {"항목":"B등급","값":"5일선 눌림 대기 / 매수 금지"},
+            {"항목":"C등급","값":"J4 한 조건 최대 +3%p 근접 / 매수 금지"},
+            {"항목":"조건변경","값":"없음"},
+        ])
+
+        sheets = {
+            "00_설정": settings,
+            "01_현황": summary,
+            "02_A완전통과": plan if not a_df.empty else a_df,
+            "03_B5일선대기": b_df,
+            "04_C근접관찰": c_df,
+            "05_전체후보": candidates,
+        }
+
+        excel_bytes = build_excel(sheets)
 
         st.download_button(
-            "📦 J6 오늘 후보 Excel 다운로드",
+            "📦 J6.1 오늘 후보/관찰 Excel 다운로드",
             data=excel_bytes,
             file_name=(
-                f"J6_paper_candidates_"
+                f"J6_1_watchlist_"
                 f"{pd.Timestamp(asof_date).strftime('%Y%m%d')}.xlsx"
             ),
-            mime=(
-                "application/"
-                "vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
 
@@ -4732,14 +4746,9 @@ if run:
         ):
             st.write(errors)
 
-st.subheader("⑤ 보유종목 청산 계산기")
+st.subheader("⑥ 보유종목 청산 계산기")
 
-st.caption(
-    "모의매매 후 보유 종목의 진입가·현재가·진입 후 최고가를 입력하면 "
-    "현재 유효 손절/트레일 가격을 계산합니다."
-)
-
-c1,c2,c3 = st.columns(3)
+c1, c2, c3 = st.columns(3)
 
 with c1:
     calc_entry = st.number_input(
@@ -4765,11 +4774,7 @@ with c3:
         step=100.0
     )
 
-if (
-    calc_entry > 0
-    and calc_current > 0
-    and calc_high > 0
-):
+if calc_entry > 0 and calc_current > 0 and calc_high > 0:
     mgmt = j6_position_management(
         calc_entry,
         calc_current,
@@ -4783,7 +4788,6 @@ if (
     )
 
 st.caption(
-    "J6 v1.0은 모의매매 운영판입니다. "
-    "실제 주문을 자동 전송하지 않으며, "
-    "전략 조건은 J4/J5.1에서 검증된 값을 그대로 사용합니다."
+    "J6.1은 관찰리스트를 추가한 모의매매 운영판입니다. "
+    "B/C 등급은 매수 조건이 아니며, A 완전통과만 실제 모의매매 대상으로 사용합니다."
 )
