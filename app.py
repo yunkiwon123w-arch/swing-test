@@ -4168,198 +4168,139 @@ def j2_pairwise_same_signal(df, mode1, mode2):
 
 
 # ============================================================
-# J4 v1.0 — J3 고정규칙 독립 종목군 재검증
-# ============================================================
 
-J4_PRIOR60_MAX = 12.905
-J4_MA5_GAP_MAX = 12.85
-J4_RULE_TEXT = f"전고점60이격(%) <= {J4_PRIOR60_MAX} AND 진입5일선이격(%) <= {J4_MA5_GAP_MAX}"
+# J5 v1.0 — J4 fixed strategy portfolio simulation
+J4_PRIOR60_MAX=12.905
+J4_MA5_GAP_MAX=12.85
+J4_RULE_TEXT=f"전고점60이격(%) <= {J4_PRIOR60_MAX} AND 진입5일선이격(%) <= {J4_MA5_GAP_MAX}"
 
-def j4_apply_frozen_rule(df):
-    if df.empty:
-        return df.copy()
-    p60 = pd.to_numeric(df["전고점60이격(%)"], errors="coerce")
-    ma5 = pd.to_numeric(df["진입5일선이격(%)"], errors="coerce")
-    return df[(p60 <= J4_PRIOR60_MAX) & (ma5 <= J4_MA5_GAP_MAX)].copy()
+def j4_apply_rule(df):
+    p60=pd.to_numeric(df["전고점60이격(%)"],errors="coerce")
+    ma5=pd.to_numeric(df["진입5일선이격(%)"],errors="coerce")
+    return df[(p60<=J4_PRIOR60_MAX)&(ma5<=J4_MA5_GAP_MAX)].copy()
 
-def j4_period_stats(df, label):
-    return {"구분": label, **j2_stats(df)}
+def j5_sim(trades, initial_cash, max_positions, market="전체"):
+    q=trades.copy()
+    if market!="전체": q=q[q["시장"]==market].copy()
+    if q.empty: return pd.DataFrame(),{}
+    q["진입일_ts"]=pd.to_datetime(q["진입일"]); q["청산일_ts"]=pd.to_datetime(q["청산일"])
+    q=q.sort_values(["진입일_ts","코드"]).reset_index(drop=True)
+    cash=float(initial_cash); openp=[]; ledger=[]; skipped=0; maxopen=0
+    dates=sorted(set(q["진입일_ts"]).union(set(q["청산일_ts"])))
+    for dt in dates:
+        for p in [x for x in openp if x["청산일_ts"]<=dt]:
+            proceeds=p["투자금"]*(1+float(p["순수익률(%)"])/100)
+            cash+=proceeds; p["실현손익"]=proceeds-p["투자금"]; ledger.append(p.copy())
+        openp=[x for x in openp if x["청산일_ts"]>dt]
+        for _,r in q[q["진입일_ts"]==dt].iterrows():
+            if len(openp)>=int(max_positions) or cash<=0:
+                skipped+=1; continue
+            slots=int(max_positions)-len(openp)
+            invest=cash/slots
+            p=r.to_dict(); p["투자금"]=invest; cash-=invest; openp.append(p)
+            maxopen=max(maxopen,len(openp))
+    for p in openp:
+        proceeds=p["투자금"]*(1+float(p["순수익률(%)"])/100)
+        cash+=proceeds; p["실현손익"]=proceeds-p["투자금"]; ledger.append(p.copy())
+    led=pd.DataFrame(ledger).sort_values(["청산일_ts","진입일_ts"]).reset_index(drop=True)
+    if led.empty:return led,{}
+    led["계좌자산"]=float(initial_cash)+led["실현손익"].cumsum()
+    peak=led["계좌자산"].cummax(); dd=(led["계좌자산"]/peak-1)*100
+    final=float(led["계좌자산"].iloc[-1]); start=pd.to_datetime(led["진입일"]).min(); end=pd.to_datetime(led["청산일"]).max()
+    yrs=max((end-start).days/365.25,1/365.25)
+    ret=pd.to_numeric(led["순수익률(%)"],errors="coerce")
+    s={"시장":market,"초기자금":int(initial_cash),"최종자산":round(final),
+       "총수익률(%)":round((final/initial_cash-1)*100,2),
+       "CAGR(%)":round(((final/initial_cash)**(1/yrs)-1)*100,2) if final>0 else -100,
+       "실제체결":len(led),"승률(%)":round((ret>0).mean()*100,1),
+       "평균거래수익률(%)":round(ret.mean(),2),"계좌MDD(%)":round(float(dd.min()),2),
+       "최대동시보유":maxopen,"미체결신호":skipped,
+       "신호체결률(%)":round(len(led)/(len(led)+skipped)*100,1)}
+    return led,s
 
-st.set_page_config(page_title="J4 v1.0 독립 종목군 재검증", layout="wide")
-st.title("🧭 J4 v1.0 · J3 고정규칙 독립 재검증")
-st.caption("J1 구조 + D 5일선 눌림 + J3 필터 완전 고정 · J3 탐색 종목을 제외한 새로운 종목군에서만 검증")
+def j5_yearly(led,initial):
+    if led.empty:return pd.DataFrame()
+    x=led.copy();x["연도"]=pd.to_datetime(x["청산일"]).dt.year;run=float(initial);rows=[]
+    for y,g in x.groupby("연도",sort=True):
+        pnl=float(g["실현손익"].sum()); start=run; run+=pnl
+        rows.append({"연도":int(y),"연초자산":round(start),"실현손익":round(pnl),
+                     "연도수익률(%)":round(pnl/start*100,2),"연말자산":round(run),
+                     "체결":len(g),"승률(%)":round((pd.to_numeric(g["순수익률(%)"],errors="coerce")>0).mean()*100,1)})
+    return pd.DataFrame(rows)
+
+st.set_page_config(page_title="J5 v1.0 실전 자금운용",layout="wide")
+st.title("💰 J5 v1.0 · J4 통과전략 실전 자금운용")
+st.caption("전략조건 고정 · 동시보유/자금제약/미체결 반영 · 전체/KOSPI/KOSDAQ 비교")
 
 with st.sidebar:
-    st.header("J4 검증 설정")
-    end_date = st.date_input("종료일", date(2026,7,31))
-    years = st.selectbox("검증 기간", [3,4,5], index=2, format_func=lambda x:f"{x}년")
-    validation_per_market = st.selectbox("시장별 독립검증 종목 수", [100,200,300], index=2)
-    discovery_skip = st.number_input("J3에서 사용한 시장별 선행 종목 수", min_value=300, max_value=1000, value=300, step=100)
-    wait_days = st.selectbox("5일선 눌림 최대 대기", [3,5,7], index=1)
-    run = st.button("▶ J4 독립검증 실행", type="primary", use_container_width=True)
+    end_date=st.date_input("종료일",date(2026,7,31))
+    years=st.selectbox("검증 기간",[3,4,5],index=2,format_func=lambda x:f"{x}년")
+    skip_per_market=st.number_input("선행 종목 수",0,1000,300,50)
+    validation_per_market=st.selectbox("시장별 검증 종목 수",[100,200,300],index=2)
+    wait_days=st.selectbox("5일선 눌림 최대 대기",[3,5,7],index=1)
+    initial_cash=st.number_input("초기자금(원)",1_000_000,1_000_000_000,10_000_000,1_000_000)
+    max_positions=st.selectbox("최대 동시보유",[3,4,5,6,8,10],index=2)
+    run=st.button("▶ J5 실행",type="primary",use_container_width=True)
 
-st.info(
-    f"J4에서는 규칙을 새로 찾지 않습니다. 고정 규칙은 **{J4_RULE_TEXT}** 입니다. "
-    "종목 목록을 코드순으로 정렬한 뒤 J3에서 사용했던 앞쪽 종목군을 건너뛰고, 그 다음 종목군만 사용합니다. "
-    "검증 결과가 나빠도 컷을 다시 조정하지 않습니다."
-)
+st.info(f"고정전략: D=첫 5일선 눌림 + {J4_RULE_TEXT}. J5에서는 전략 컷을 새로 찾지 않습니다.")
 
 if run:
-    end_ts = pd.Timestamp(end_date)
-    cut_date = end_ts - pd.DateOffset(years=int(years))
-    start_ts = cut_date - pd.Timedelta(days=220)
-    fetch_end = end_ts + pd.Timedelta(days=60)
-
-    try:
-        listing = stock_listing()
-    except Exception as e:
-        st.error(f"종목 목록 조회 실패: {type(e).__name__}")
-        st.exception(e); st.stop()
-
-    universes = {}
-    universe_rows = []
-    for market in ["KOSPI", "KOSDAQ"]:
-        all_m = listing[listing["Market"] == market].sort_values("Code").reset_index(drop=True)
-        start_i = int(discovery_skip)
-        end_i = start_i + int(validation_per_market)
-        u = all_m.iloc[start_i:end_i].copy().reset_index(drop=True)
-        universes[market] = u
-        universe_rows.append({
-            "시장": market, "전체상장수": len(all_m), "검증시작순번": start_i+1,
-            "검증종료순번": start_i+len(u), "실제검증종목수": len(u)
-        })
-
-    total = sum(len(x) for x in universes.values())
-    if total == 0:
-        st.error("독립검증 종목군이 비어 있습니다. 선행 종목 수를 줄여주세요."); st.stop()
-
-    done=0; setups=[]; data_map={}; errors=[]
-    progress=st.progress(0); status=st.empty()
-    for market, universe in universes.items():
-        for _, r in universe.iterrows():
-            done += 1
-            code0=str(r["Code"]).zfill(6); name=r["Name"]
-            status.info(f"{market} 독립 종목군 J1 신호 탐색 {done}/{total} · {name}")
+    end_ts=pd.Timestamp(end_date); cut=end_ts-pd.DateOffset(years=int(years))
+    start_ts=cut-pd.Timedelta(days=220); fetch_end=end_ts+pd.Timedelta(days=60)
+    listing=stock_listing(); universes={}
+    for market in ["KOSPI","KOSDAQ"]:
+        m=listing[listing["Market"]==market].sort_values("Code").reset_index(drop=True)
+        universes[market]=m.iloc[int(skip_per_market):int(skip_per_market)+int(validation_per_market)].copy()
+    total=sum(len(v) for v in universes.values()); done=0; setups=[];data_map={};errors=[]
+    prog=st.progress(0);status=st.empty()
+    for market,u in universes.items():
+        for _,r in u.iterrows():
+            done+=1;code=str(r["Code"]).zfill(6);name=r["Name"];status.info(f"{market} {done}/{total} · {name}")
             try:
-                d=load_data(code0,start_ts.strftime("%Y-%m-%d"),fetch_end.strftime("%Y-%m-%d"))
-                if d is None or d.empty or len(d)<160:
-                    progress.progress(done/max(total,1)); continue
-                found,prepared=j1_find_setups(d,code0,name,market,cut_date,end_ts)
-                data_map[(market,code0)]=prepared
-                if found: setups.extend(found)
-            except Exception as e:
-                errors.append(f"{market} {name}({code0}): {type(e).__name__}")
-            progress.progress(done/max(total,1)); time.sleep(0.003)
-
-    if not setups:
-        progress.empty(); status.warning("독립 종목군에서 J1 구조 신호가 없습니다."); st.stop()
-
-    setup_df=(pd.DataFrame(setups).sort_values(["돌파일","코드"])
-              .drop_duplicates(["코드","돌파일"]).reset_index(drop=True))
-    setup_df["신호ID"]=[f"V{i+1:05d}" for i in range(len(setup_df))]
-
+                d=load_data(code,start_ts.strftime("%Y-%m-%d"),fetch_end.strftime("%Y-%m-%d"))
+                if d is None or d.empty or len(d)<160: prog.progress(done/max(total,1));continue
+                found,prepared=j1_find_setups(d,code,name,market,cut,end_ts);data_map[(market,code)]=prepared
+                if found:setups.extend(found)
+            except Exception as e:errors.append(f"{market} {name}({code}): {type(e).__name__}")
+            prog.progress(done/max(total,1));time.sleep(.003)
+    if not setups:prog.empty();st.warning("신호 없음");st.stop()
+    setup=pd.DataFrame(setups).sort_values(["돌파일","코드"]).drop_duplicates(["코드","돌파일"]).reset_index(drop=True)
+    setup["신호ID"]=[f"S{i+1:05d}" for i in range(len(setup))]
     rows=[]
-    for pos,(_,setup) in enumerate(setup_df.iterrows(),1):
-        key=(setup["시장"],str(setup["코드"]).zfill(6)); d=data_map.get(key)
-        if d is None: continue
-        entries=j2_make_entries(d,setup,wait_days=int(wait_days))
-        entries=[e for e in entries if e["진입전략"]=="D 5일선 눌림"]
-        for entry in entries:
-            ev=j2_evaluate_trade(d,setup,entry)
-            if ev is None: continue
-            row=setup.drop(labels=["_b","_breakout_i"],errors="ignore").to_dict()
-            row.update({k:v for k,v in entry.items() if not k.startswith("_")})
-            row.update(ev); rows.append(row)
-        if pos%20==0 or pos==len(setup_df):
-            status.info(f"D 진입 평가 {pos}/{len(setup_df)} · 체결 {len(rows)}건")
-
-    progress.empty(); trades=pd.DataFrame(rows)
-    if trades.empty:
-        status.warning("독립 종목군에서 D=5일선 눌림 체결이 없습니다."); st.stop()
-    status.success(f"완료 · 독립 종목 {total}개 · J1 원신호 {len(setup_df)}건 · D 체결 {len(trades)}건")
-
-    selected=j4_apply_frozen_rule(trades)
-    summary=pd.DataFrame([
-        j4_period_stats(trades,"독립검증 D 원본"),
-        j4_period_stats(selected,"독립검증 J3고정필터"),
-    ])
-    base_s=j2_stats(trades); sel_s=j2_stats(selected)
-    keep=(len(selected)/len(trades)*100) if len(trades) else 0
-    delta=sel_s["승률(%)"]-base_s["승률(%)"] if len(selected) else float('nan')
-
-    st.subheader("① 독립검증 종목군")
-    universe_df=pd.DataFrame(universe_rows)
-    st.dataframe(universe_df,use_container_width=True,hide_index=True)
-
-    st.subheader("② J3 고정규칙")
-    st.write(f"**{J4_RULE_TEXT}**")
-    st.caption("이 컷은 J4 데이터에서 산출하거나 조정하지 않습니다.")
-
-    st.subheader("③ 독립검증 결과")
-    st.dataframe(summary,use_container_width=True,hide_index=True)
-    c1,c2,c3,c4=st.columns(4)
-    c1.metric("필터 후 신호", f"{sel_s['신호']}건")
-    c2.metric("필터 후 승률", f"{sel_s['승률(%)']:.1f}%", f"{delta:+.1f}%p vs 원본" if len(selected) else None)
-    c3.metric("평균수익률", f"{sel_s['평균수익률(%)']:.2f}%")
-    c4.metric("보존율", f"{keep:.1f}%")
-
-    pass_core=(sel_s["신호"]>=50 and sel_s["승률(%)"]>=50 and
-               sel_s["평균수익률(%)"]>0 and sel_s["ProfitFactor"]>=2.0 and
-               sel_s["손절률(%)"]<=45)
-    if pass_core:
-        st.success("✅ J4 독립 재검증 통과 · 고정 규칙을 실전전략 후보로 승격할 수 있는 수준입니다.")
-    else:
-        st.warning("⚠️ J4 독립 재검증 기준 미충족 · 규칙을 즉시 재최적화하지 말고 실패 원인을 별도 분석해야 합니다.")
-
-    st.subheader("④ 연도별 안정성")
-    tmp=selected.copy()
-    tmp["진입일"]=pd.to_datetime(tmp["진입일"],errors="coerce")
-    yearly=[]
-    for y,z in tmp.dropna(subset=["진입일"]).groupby(tmp["진입일"].dt.year):
-        yearly.append({"연도":int(y),**j2_stats(z)})
-    yearly_df=pd.DataFrame(yearly)
-    st.dataframe(yearly_df,use_container_width=True,hide_index=True)
-
-    st.subheader("⑤ 시장별 안정성")
-    market_rows=[]
-    for m,z in selected.groupby("시장"):
-        market_rows.append({"시장":m,**j2_stats(z)})
-    market_df=pd.DataFrame(market_rows)
-    st.dataframe(market_df,use_container_width=True,hide_index=True)
-
-    st.subheader("⑥ 필터 통과 거래")
-    show_cols=["신호ID","시장","종목명","코드","기준봉일","돌파일","진입일",
-               "전고점60이격(%)","진입5일선이격(%)","순수익률(%)","청산사유"]
-    st.dataframe(selected[[c for c in show_cols if c in selected.columns]],use_container_width=True,hide_index=True)
-
+    for _,s in setup.iterrows():
+        d=data_map.get((s["시장"],str(s["코드"]).zfill(6)))
+        if d is None:continue
+        es=[e for e in j2_make_entries(d,s,int(wait_days)) if e["진입전략"]=="D 5일선 눌림"]
+        for e in es:
+            ev=j2_evaluate_trade(d,s,e)
+            if ev is None:continue
+            row=s.drop(labels=["_b","_breakout_i"],errors="ignore").to_dict()
+            row.update({k:v for k,v in e.items() if not k.startswith("_")});row.update(ev);rows.append(row)
+    prog.empty();trades=pd.DataFrame(rows)
+    if trades.empty:st.warning("D 체결 없음");st.stop()
+    selected=j4_apply_rule(trades);status.success(f"D 체결 {len(trades)}건 · 고정필터 통과 {len(selected)}건")
+    sums=[];leds={};yrs={}
+    for m in ["전체","KOSPI","KOSDAQ"]:
+        led,s=j5_sim(selected,int(initial_cash),int(max_positions),m);leds[m]=led;yrs[m]=j5_yearly(led,int(initial_cash))
+        if s:sums.append(s)
+    summary=pd.DataFrame(sums)
+    st.subheader("① 실전 계좌 성과");st.dataframe(summary,use_container_width=True,hide_index=True)
+    st.subheader("② 연도별 계좌 성과")
+    for m in ["전체","KOSPI","KOSDAQ"]:
+        st.markdown(f"**{m}**");st.dataframe(yrs[m],use_container_width=True,hide_index=True)
+    st.subheader("③ 실제 체결 거래")
+    for m in ["전체","KOSPI","KOSDAQ"]:
+        with st.expander(m):st.dataframe(leds[m],use_container_width=True,hide_index=True)
     settings=pd.DataFrame([
-        {"항목":"버전","값":"J4 v1.0 독립 종목군 재검증"},
-        {"항목":"고정 진입","값":"D = 재돌파 후 첫 5일선 터치"},
-        {"항목":"J3 고정규칙","값":J4_RULE_TEXT},
-        {"항목":"종목군 분리","값":f"시장별 코드순 앞 {int(discovery_skip)}개 제외 후 다음 {int(validation_per_market)}개"},
-        {"항목":"검증기간","값":f"{cut_date.date()} ~ {end_ts.date()}"},
-        {"항목":"최대 대기","값":f"{int(wait_days)}거래일"},
-        {"항목":"통과기준","값":"신호>=50, 승률>=50%, 평균수익>0, PF>=2.0, 손절률<=45%"},
-        {"항목":"원칙","값":"J4 데이터로 컷 탐색/수정 금지"},
-    ])
-    excel_bytes=build_excel({
-        "00_설정":settings,
-        "01_독립종목군":universe_df,
-        "02_검증요약":summary,
-        "03_연도별":yearly_df,
-        "04_시장별":market_df,
-        "05_D전체거래":trades,
-        "06_J3필터통과":selected,
-    })
-    st.download_button(
-        "📦 J4 v1.0 독립 재검증 Excel 다운로드",
-        data=excel_bytes,
-        file_name="swing_J4_v1_0_independent_universe_validation.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
-    )
+        {"항목":"전략","값":f"D 첫 5일선 눌림 + {J4_RULE_TEXT}"},
+        {"항목":"초기자금","값":int(initial_cash)},{"항목":"최대동시보유","값":int(max_positions)},
+        {"항목":"자금배분","값":"남은 슬롯 기준 동일비중"},{"항목":"전략비용","값":"기존 0.40% 포함"},
+        {"항목":"원칙","값":"전략 재최적화 없음"}])
+    sheets={"00_설정":settings,"01_계좌비교":summary,"02_고정필터거래":selected}
+    for m in ["전체","KOSPI","KOSDAQ"]:
+        sheets[f"10_{m}_체결"]=leds[m];sheets[f"11_{m}_연도"]=yrs[m]
+    excel=build_excel(sheets)
+    st.download_button("📦 J5 v1.0 Excel 다운로드",data=excel,file_name="swing_J5_v1_0_portfolio_simulation.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     if errors:
-        with st.expander(f"조회 실패/데이터 부족 {len(errors)}건"):
-            st.write(errors)
-
-st.caption("J4 v1.0 · J3 규칙 고정 · 새로운 종목군 독립검증 · 결과를 본 뒤 같은 검증군에 맞춰 컷을 수정하지 않습니다.")
+        with st.expander(f"조회 실패 {len(errors)}건"):st.write(errors)
