@@ -4174,9 +4174,9 @@ def j2_pairwise_same_signal(df, mode1, mode2):
 
 
 # ============================================================
-# J6.5 — funnel diagnostic dashboard
+# J6.4 — funnel diagnostic dashboard
 
-st.info("J6.5 수정사항: 데이터 조회기간만 220→300 달력일로 확대했습니다. 160봉 기준과 J1/J4/D진입 등 전략 조건은 변경하지 않았습니다.")
+st.info("J6.4 수정사항: 데이터 조회기간만 220→300 달력일로 확대했습니다. 160봉 기준과 J1/J4/D진입 등 전략 조건은 변경하지 않았습니다.")
 # ============================================================
 
 J4_PRIOR60_MAX = 12.905
@@ -4641,6 +4641,163 @@ def j6_position_management(entry_price, current_price, highest_price):
     }
 
 
+
+# ============================================================
+# J6.6 — A 완전통과 실제 일봉 추적
+# ============================================================
+
+def j66_track_a_candidates(a_detail, asof_date):
+    """
+    A 완전통과 종목만 진입일부터 기준일까지 실제 일봉으로 추적한다.
+
+    고정 규칙
+    - 진입가: 기존 D 첫 5일선 눌림 진입가
+    - 초기손절: -3%
+    - 트레일 활성: 진입 후 +2% 도달
+    - 트레일: 전일까지 최고가 대비 -2%, 단 진입가 아래로 내리지 않음
+    - 정상 평가는 진입 다음 거래일부터
+    - 최대 보유: 진입 후 완전한 5거래일
+    - 일봉 내 고가/저가 선후관계 불명확 시 stop 우선 보수 처리
+    """
+    if a_detail is None or a_detail.empty:
+        return pd.DataFrame(), []
+
+    rows = []
+    errors = []
+    fetch_end = pd.Timestamp(asof_date) + pd.Timedelta(days=1)
+
+    for _, r in a_detail.iterrows():
+        try:
+            code = str(r["코드"]).zfill(6)
+            name = r["종목명"]
+            market = r["시장"]
+            entry_date = pd.Timestamp(r["진입일"]).normalize()
+            entry_price = float(r["진입가"])
+
+            d = load_data(
+                code,
+                (entry_date - pd.Timedelta(days=30)).strftime("%Y-%m-%d"),
+                fetch_end.strftime("%Y-%m-%d")
+            )
+            if d is None or d.empty:
+                raise ValueError("가격데이터 없음")
+
+            d = d.sort_index()
+            idx_norm = pd.DatetimeIndex(d.index).normalize()
+            hit_idx = np.where(idx_norm == entry_date)[0]
+            if len(hit_idx) == 0:
+                raise ValueError("진입일 데이터 없음")
+
+            entry_i = int(hit_idx[-1])
+            initial_stop = entry_price * 0.97
+            activate_price = entry_price * 1.02
+
+            highest_before_today = entry_price
+            activated = False
+            exit_i = None
+            exit_price = None
+            exit_reason = None
+            active_stop = initial_stop
+            mfe = 0.0
+            mae = 0.0
+            evaluated_days = 0
+
+            last_i = min(len(d) - 1, entry_i + 5)
+
+            for i in range(entry_i + 1, last_i + 1):
+                evaluated_days += 1
+                high = float(d.iloc[i]["High"])
+                low = float(d.iloc[i]["Low"])
+
+                if activated:
+                    trailing = highest_before_today * 0.98
+                    active_stop = max(entry_price, trailing)
+                else:
+                    active_stop = initial_stop
+
+                high_ret = (high / entry_price - 1) * 100
+                low_ret = (low / entry_price - 1) * 100
+
+                if low <= active_stop:
+                    mae = min(mae, (active_stop / entry_price - 1) * 100)
+                    if high < activate_price:
+                        mfe = max(mfe, max(0.0, high_ret))
+                    exit_i = i
+                    exit_price = active_stop
+                    exit_reason = (
+                        "본전/트레일"
+                        if activated and active_stop >= entry_price
+                        else "손절"
+                    )
+                    break
+
+                mfe = max(mfe, high_ret)
+                mae = min(mae, low_ret)
+
+                if high >= activate_price:
+                    activated = True
+
+                highest_before_today = max(highest_before_today, high)
+
+            current_i = min(len(d) - 1, entry_i + evaluated_days)
+            current_close = float(d.iloc[current_i]["Close"])
+
+            # If five full trading days were completed without a stop, close on day 5.
+            if exit_i is None and evaluated_days >= 5:
+                exit_i = entry_i + 5
+                exit_price = float(d.iloc[exit_i]["Close"])
+                exit_reason = "기간종료"
+
+            if exit_i is not None:
+                status = "청산완료"
+                mark_price = float(exit_price)
+                mark_date = pd.Timestamp(d.index[exit_i]).date()
+                active_stop_display = None
+            else:
+                # Recalculate the stop that would be active on the NEXT trading day.
+                if activated:
+                    next_stop = max(entry_price, highest_before_today * 0.98)
+                    state = "트레일 활성"
+                else:
+                    next_stop = initial_stop
+                    state = "초기손절 구간"
+
+                status = f"보유중 · {state}"
+                mark_price = current_close
+                mark_date = pd.Timestamp(d.index[current_i]).date()
+                active_stop_display = round(next_stop, 2)
+
+            gross_ret = (mark_price / entry_price - 1) * 100
+
+            rows.append({
+                "시장": market,
+                "종목명": name,
+                "코드": code,
+                "진입일": entry_date.date(),
+                "진입가": round(entry_price, 2),
+                "초기손절가": round(initial_stop, 2),
+                "+2%활성가": round(activate_price, 2),
+                "평가거래일수": evaluated_days,
+                "상태": status,
+                "현재/청산일": mark_date,
+                "현재/청산가": round(mark_price, 2),
+                "현재유효손절가": active_stop_display,
+                "진입후최고가": round(highest_before_today, 2),
+                "평가수익률(%)": round(gross_ret, 2),
+                "MFE(%)": round(mfe, 2),
+                "MAE(%)": round(mae, 2),
+                "청산사유": exit_reason or "",
+            })
+
+        except Exception as e:
+            errors.append(
+                f"{r.get('종목명','')}({r.get('코드','')}): "
+                f"{type(e).__name__} - {e}"
+            )
+
+    return pd.DataFrame(rows), errors
+
+
 # ============================================================
 # UI
 # ============================================================
@@ -4651,13 +4808,13 @@ st.set_page_config(
 )
 
 st.title(
-    "🟢 J6.5 · 후보 0건 원인 진단판"
+    "🟢 J6.6 · A 완전통과 모의매매 추적판"
 )
 
 st.caption("조건은 변경하지 않고, 어느 단계에서 후보가 사라지는지 카운트합니다.")
 
 with st.sidebar:
-    st.header("J6.5 진단 설정")
+    st.header("J6.6 운영 설정")
 
     asof_date = st.date_input(
         "기준일",
@@ -4735,7 +4892,7 @@ if run:
         st.stop()
 
     with st.spinner(
-        "J6.5 단계별 탈락 원인을 진단 중입니다..."
+        "J6.6 후보 진단 및 추적 준비 중입니다..."
     ):
         funnel, diagnostic_detail, diagnostic_errors = j64_diagnostic_funnel(
             listing,
@@ -4775,6 +4932,51 @@ if run:
         )
         st.subheader("④ 주요 탈락 원인")
         st.dataframe(stage_summary, use_container_width=True, hide_index=True)
+
+        st.subheader("⑤ A 완전통과 · 실제 일봉 모의매매 추적")
+        a_diag = diagnostic_detail[
+            diagnostic_detail["최종단계"] == "A완전통과"
+        ].copy()
+
+        if a_diag.empty:
+            st.info("이번 기준일에는 추적할 A 완전통과 종목이 없습니다.")
+        else:
+            track_df, track_errors = j66_track_a_candidates(
+                a_diag,
+                pd.Timestamp(asof_date)
+            )
+            if track_df.empty:
+                st.warning("A 후보는 있으나 일봉 추적 결과를 만들지 못했습니다.")
+            else:
+                st.dataframe(
+                    track_df,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                closed = track_df[track_df["상태"] == "청산완료"]
+                holding = track_df[track_df["상태"].str.startswith("보유중", na=False)]
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("A 완전통과", len(track_df))
+                c2.metric("현재 보유중", len(holding))
+                c3.metric("청산완료", len(closed))
+
+                if not closed.empty:
+                    st.caption(
+                        "청산완료 평균 평가수익률: "
+                        f"{closed['평가수익률(%)'].mean():.2f}%"
+                    )
+
+                st.caption(
+                    "진입 당일 OHLC는 손절/트레일 판정에 사용하지 않고, "
+                    "다음 거래일부터 -3% 손절 → +2% 활성 → 전일까지 최고가 -2% "
+                    "트레일 → 최대 5거래일 순으로 추적합니다."
+                )
+
+            if track_errors:
+                with st.expander(f"추적 오류 {len(track_errors)}건"):
+                    st.write(track_errors[:30])
 
     with st.spinner(
         "완전통과·대기·근접 후보를 검색 중입니다..."
@@ -4940,7 +5142,7 @@ if run:
         excel_bytes = build_excel(sheets)
 
         st.download_button(
-            "📦 J6.5 진단 Excel 다운로드",
+            "📦 J6.4 진단 Excel 다운로드",
             data=excel_bytes,
             file_name=(
                 f"J6_2_diagnostic_"
@@ -5000,6 +5202,11 @@ if calc_entry > 0 and calc_current > 0 and calc_high > 0:
     )
 
 st.caption(
-    "J6.5는 조건을 변경하지 않고 후보가 사라지는 단계를 진단하는 운영판입니다. "
+    "J6.4는 조건을 변경하지 않고 후보가 사라지는 단계를 진단하는 운영판입니다. "
     "B/C 등급은 매수 조건이 아니며, A 완전통과만 실제 모의매매 대상으로 사용합니다."
+)
+
+st.caption(
+    "J6.6 기준: J6.2 진단에서 확인된 A 완전통과 구조를 그대로 사용하며, "
+    "J1/J4/D진입 컷은 변경하지 않습니다."
 )
