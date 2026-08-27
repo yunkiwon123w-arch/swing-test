@@ -4174,9 +4174,9 @@ def j2_pairwise_same_signal(df, mode1, mode2):
 
 
 # ============================================================
-# J6.4 — funnel diagnostic dashboard
+# J6.5 — funnel diagnostic dashboard
 
-st.info("J6.4 수정사항: 데이터 조회기간만 220→300 달력일로 확대했습니다. 160봉 기준과 J1/J4/D진입 등 전략 조건은 변경하지 않았습니다.")
+st.info("J6.5 수정사항: 데이터 조회기간만 220→300 달력일로 확대했습니다. 160봉 기준과 J1/J4/D진입 등 전략 조건은 변경하지 않았습니다.")
 # ============================================================
 
 J4_PRIOR60_MAX = 12.905
@@ -4651,13 +4651,13 @@ st.set_page_config(
 )
 
 st.title(
-    "🟢 J6.4 · 후보 0건 원인 진단판"
+    "🟢 J6.5 · 후보 0건 원인 진단판"
 )
 
 st.caption("조건은 변경하지 않고, 어느 단계에서 후보가 사라지는지 카운트합니다.")
 
 with st.sidebar:
-    st.header("J6.4 진단 설정")
+    st.header("J6.5 진단 설정")
 
     asof_date = st.date_input(
         "기준일",
@@ -4735,7 +4735,7 @@ if run:
         st.stop()
 
     with st.spinner(
-        "J6.4 단계별 탈락 원인을 진단 중입니다..."
+        "J6.5 단계별 탈락 원인을 진단 중입니다..."
     ):
         funnel, diagnostic_detail, diagnostic_errors = j64_diagnostic_funnel(
             listing,
@@ -4940,7 +4940,7 @@ if run:
         excel_bytes = build_excel(sheets)
 
         st.download_button(
-            "📦 J6.4 진단 Excel 다운로드",
+            "📦 J6.5 진단 Excel 다운로드",
             data=excel_bytes,
             file_name=(
                 f"J6_2_diagnostic_"
@@ -5000,6 +5000,6 @@ if calc_entry > 0 and calc_current > 0 and calc_high > 0:
     )
 
 st.caption(
-    "J6.4는 조건을 변경하지 않고 후보가 사라지는 단계를 진단하는 운영판입니다. "
+    "J6.5는 조건을 변경하지 않고 후보가 사라지는 단계를 진단하는 운영판입니다. "
     "B/C 등급은 매수 조건이 아니며, A 완전통과만 실제 모의매매 대상으로 사용합니다."
 )
